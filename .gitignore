@@ -9,3 +9,4 @@ _uploads/
 .ruff_cache/
 *.log
 data2/
+result/**/*.xlsx
