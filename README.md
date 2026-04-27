@@ -8,12 +8,13 @@
 
 ## 1. 安装依赖
 
-在 PowerShell 中执行：
+安装 uv 后，在项目根目录执行：
 
 ```powershell
-cd "C:\Users\10157\Desktop\xds"
-python -m pip install -r requirements.txt
+uv sync
 ```
+
+`uv sync` 会按 `.python-version` 创建本地虚拟环境 `.venv`，并根据 `pyproject.toml` / `uv.lock` 安装依赖。依赖声明以 `pyproject.toml` 为准，锁定版本记录在 `uv.lock`。
 
 ## 2. 准备输入数据
 
@@ -22,16 +23,16 @@ python -m pip install -r requirements.txt
 如果你手里是原始 CSV，默认处理链路如下：
 
 ```powershell
-python code/process_data2_to_excel.py
-python code/aggregate_processed_metrics.py --granularity 1h
+uv run python code/process_data2_to_excel.py
+uv run python code/aggregate_processed_metrics.py --granularity 1h
 ```
 
 `--granularity` 支持 `1h`，也支持任意正整数分钟粒度，例如 `1min`、`5min`、`10min`、`30min`。
 两个处理脚本都支持 `--workers` 开启多线程，`0` 表示自动选择线程数，`1` 表示单线程。例如：
 
 ```powershell
-python code/process_data2_to_excel.py --workers 8
-python code/aggregate_processed_metrics.py --granularity 1min --workers 8
+uv run python code/process_data2_to_excel.py --workers 8
+uv run python code/aggregate_processed_metrics.py --granularity 1min --workers 8
 ```
 
 默认输出文件：
@@ -42,7 +43,7 @@ python code/aggregate_processed_metrics.py --granularity 1min --workers 8
 如果需要本地造一份演示数据，可以先执行：
 
 ```powershell
-python code/generate_fake_data2.py
+uv run python code/generate_fake_data2.py
 ```
 
 再运行上面的两个处理脚本。
@@ -50,7 +51,7 @@ python code/generate_fake_data2.py
 ## 3. 启动网页
 
 ```powershell
-python code/webapp.py
+uv run python code/webapp.py
 ```
 
 浏览器访问：

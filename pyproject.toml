@@ -1,0 +1,16 @@
+[project]
+name = "xds-latency-anomaly"
+version = "0.1.0"
+description = "Local Flask and Plotly app for pool latency anomaly detection."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flask",
+    "numpy",
+    "openpyxl",
+    "pandas",
+    "plotly",
+]
+
+[tool.uv]
+package = false
