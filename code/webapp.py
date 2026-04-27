@@ -1022,12 +1022,11 @@ def build_latency_system_figure(
     fig.update_yaxes(title_text="TPM", row=2, col=1, secondary_y=True)
     fig.update_xaxes(title_text="时间", row=2, col=1)
     fig.update_layout(
-        title="系统延迟与流量趋势",
         template=CHART_TEMPLATE,
         width=CHART_WIDTH,
         height=SYSTEM_CHART_HEIGHT,
-        margin=CHART_MARGIN,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin={**CHART_MARGIN, "t": 72},
+        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0),
     )
     return fig
 
