@@ -1246,7 +1246,6 @@ def build_latency_user_figure(
     fig.update_yaxes(title_text="Completion", row=3, col=1, secondary_y=True)
     fig.update_xaxes(title_text="时间", row=3, col=1)
     fig.update_layout(
-        title="用户延迟、流量与 Token 趋势",
         template=CHART_TEMPLATE,
         width=CHART_WIDTH,
         height=USER_CHART_HEIGHT,
