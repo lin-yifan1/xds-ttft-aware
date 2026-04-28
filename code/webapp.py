@@ -5,11 +5,13 @@
 import json
 
 import os
+import sqlite3
 
 import uuid
 
 
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 from time import perf_counter
 
@@ -68,7 +70,6 @@ from config import (
     POOL_UNNAMED_SERVICE_LABEL,
     PROJECT_ROOT,
     SENSITIVITY_OPTIONS,
-    SHEET_NAME_SEPARATOR,
     SYSTEM_CHART_HEIGHT,
     TIMING_PIE_HEIGHT,
     TIMING_PIE_TOP_N,
@@ -79,6 +80,7 @@ from config import (
     WEB_PORT,
     LatencyDetectorConfig,
 )
+from aggregate_processed_metrics import AGGREGATED_COLUMNS, AGGREGATED_TABLE
 from latency_detector import detect_latency_anomalies
 
 
@@ -97,45 +99,96 @@ EVENT_USER_CONTEXT_POINTS = 180
 
 
 
-# Multi-sheet aggregated workbooks use `{group_key}__{service_name}`.
-POOL_SHEET_SEP = SHEET_NAME_SEPARATOR
+SQLITE_INPUT_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".s3db"}
 
 
-def parse_pool_sheet_name(sheet_name: str) -> tuple[str, str, bool]:
-    """Parse a workbook sheet name into (group_key, service_name, is_all)."""
-    s = str(sheet_name).strip()
-    if POOL_SHEET_SEP not in s:
-        return s, "", True
-    a, b = s.split(POOL_SHEET_SEP, 1)
-    a, b = a.strip(), b.strip()
-    is_all = b in POOL_ALL_MARKERS or b == ""
-    return a, b, is_all
+def validate_aggregated_database(db_path: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    conn = sqlite3.connect(db_path)
+    try:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (AGGREGATED_TABLE,),
+        ).fetchone()
+        if not table_exists:
+            raise ValueError(f"missing table {AGGREGATED_TABLE!r}")
+
+        columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({AGGREGATED_TABLE})")}
+        missing = [col for col in AGGREGATED_COLUMNS if col not in columns]
+        if missing:
+            raise ValueError(f"missing required columns: {missing}")
+
+        rows = conn.execute(
+            f"""
+            SELECT infer_service_id, service_name, COUNT(*) AS row_count
+            FROM {AGGREGATED_TABLE}
+            GROUP BY infer_service_id, service_name
+            ORDER BY infer_service_id, service_name
+            """
+        ).fetchall()
+        groups = [
+            {
+                "group_id": str(idx),
+                "infer_service_id": str(infer_service_id),
+                "service_name": str(service_name),
+                "row_count": int(row_count),
+            }
+            for idx, (infer_service_id, service_name, row_count) in enumerate(rows)
+        ]
+        if not groups:
+            raise ValueError("no service groups found")
+        return groups
+    finally:
+        conn.close()
 
 
-def build_pool_sheet_groups(sheet_names: list[str]) -> list[dict[str, Any]]:
+def build_pool_service_groups(service_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build grouped select options for the pool/service picker."""
     from collections import defaultdict
 
-    buckets: dict[str, list[str]] = defaultdict(list)
-    for sn in sheet_names:
-        pk, _, _ = parse_pool_sheet_name(sn)
-        buckets[pk].append(sn)
+    buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for group in service_groups:
+        buckets[str(group["infer_service_id"])].append(group)
 
     groups: list[dict[str, Any]] = []
     for pool_key in sorted(buckets.keys()):
-        options: list[dict[str, str]] = []
-        for sn in sorted(buckets[pool_key]):
-            _, svc, is_all = parse_pool_sheet_name(sn)
-            if is_all:
+        options: list[dict[str, Any]] = []
+        for group in sorted(buckets[pool_key], key=lambda item: str(item["service_name"])):
+            service_name = str(group["service_name"]).strip()
+            if service_name in POOL_ALL_MARKERS or service_name == "":
                 label = POOL_ALL_SERVICE_LABEL
-            elif svc:
-                label = svc
             else:
-                label = POOL_UNNAMED_SERVICE_LABEL
-            options.append({"sheet_name": sn, "label": label})
+                label = service_name or POOL_UNNAMED_SERVICE_LABEL
+            options.append(
+                {
+                    "group_id": group["group_id"],
+                    "label": label,
+                    "row_count": int(group["row_count"]),
+                }
+            )
         options.sort(key=lambda o: (0 if o["label"] == POOL_ALL_SERVICE_LABEL else 1, o["label"]))
         groups.append({"pool_key": pool_key, "options": options})
     return groups
+
+
+def find_service_group(service_groups: list[dict[str, Any]], group_id: str) -> dict[str, Any] | None:
+    return next((group for group in service_groups if str(group["group_id"]) == str(group_id)), None)
+
+
+def load_aggregated_group(db_path: str | os.PathLike[str], group: dict[str, Any]) -> pd.DataFrame:
+    conn = sqlite3.connect(db_path)
+    try:
+        return pd.read_sql_query(
+            f"""
+            SELECT domain_id, rpm, tpm, ttft_avg, tpot_avg, prompt_tokens, completion_tokens, collect_time_std
+            FROM {AGGREGATED_TABLE}
+            WHERE infer_service_id = ? AND service_name = ?
+            ORDER BY domain_id, collect_time_std
+            """,
+            conn,
+            params=(group["infer_service_id"], group["service_name"]),
+        )
+    finally:
+        conn.close()
 
 
 def _pool_upload_display_name(info: dict[str, Any]) -> str:
@@ -262,7 +315,7 @@ def create_app() -> Flask:
 
     app.config["SESSIONS"] = {}
 
-    # Pool analysis upload cache: upload_id -> { file_path, sheet_names, file_name }.
+    # Pool analysis upload cache: upload_id -> { file_path, service_groups, file_name }.
 
     app.config["POOL_UPLOADS"] = {}
 
@@ -287,37 +340,32 @@ def create_app() -> Flask:
     @app.post("/pool")
 
     def pool_upload():
-        f_workbook = request.files.get("file_workbook")
-        has_file = bool(f_workbook and f_workbook.filename)
+        f_database = request.files.get("file_database")
+        has_file = bool(f_database and f_database.filename)
         if not has_file:
-            flash("请先上传 Excel 文件", "danger")
+            flash("请先上传 SQLite 数据库文件", "danger")
             return redirect(url_for("pool_index"))
 
-        if not (f_workbook.filename.lower().endswith(".xlsx") or f_workbook.filename.lower().endswith(".xls")):
-            flash("请上传 Excel 文件（.xlsx / .xls）", "danger")
+        suffix = Path(f_database.filename).suffix.lower()
+        if suffix not in SQLITE_INPUT_SUFFIXES:
+            flash("请上传 SQLite 文件（.sqlite / .sqlite3 / .db / .s3db）", "danger")
             return redirect(url_for("pool_index"))
 
-        filename = secure_filename(f_workbook.filename)
+        filename = secure_filename(f_database.filename)
         upload_id = uuid.uuid4().hex
         saved_path = UPLOAD_DIR / f"pool_{upload_id}__latency__{filename}"
-        f_workbook.save(saved_path)
+        f_database.save(saved_path)
 
         try:
-            xl = pd.ExcelFile(saved_path)
-            sheet_names = xl.sheet_names
-            xl.close()
+            service_groups = validate_aggregated_database(saved_path)
         except Exception as e:
-            flash(f"读取 Excel 失败：{e}", "danger")
-            return redirect(url_for("pool_index"))
-
-        if not sheet_names:
-            flash("Excel 中没有可用的 sheet", "danger")
+            flash(f"读取 SQLite 失败：{e}", "danger")
             return redirect(url_for("pool_index"))
 
         app.config["POOL_UPLOADS"][upload_id] = {
             "file_path": str(saved_path),
             "file_name": filename,
-            "sheet_names": sheet_names,
+            "service_groups": service_groups,
         }
 
         return redirect(url_for("pool_select", upload_id=upload_id))
@@ -332,7 +380,7 @@ def create_app() -> Flask:
 
         if not info:
 
-            flash("上传信息已失效，请重新上传 Excel", "warning")
+            flash("上传信息已失效，请重新上传 SQLite", "warning")
 
             return redirect(url_for("pool_index"))
 
@@ -344,9 +392,9 @@ def create_app() -> Flask:
 
             file_name=_pool_upload_display_name(info),
 
-            sheet_names=info["sheet_names"],
+            service_group_count=len(info["service_groups"]),
 
-            sheet_groups=build_pool_sheet_groups(info["sheet_names"]),
+            service_groups=build_pool_service_groups(info["service_groups"]),
 
             sensitivity_options=SENSITIVITY_OPTIONS,
 
@@ -376,25 +424,26 @@ def create_app() -> Flask:
 
         if not info:
 
-            flash("上传信息已失效，请重新上传 Excel", "warning")
+            flash("上传信息已失效，请重新上传 SQLite", "warning")
 
             return redirect(url_for("pool_index"))
 
-        sheet_name = request.form.get("sheet_name", "").strip()
+        group_id = request.form.get("group_id", "").strip()
+        service_group = find_service_group(info["service_groups"], group_id)
 
-        if not sheet_name or sheet_name not in info["sheet_names"]:
+        if service_group is None:
 
-            flash("请选择有效的 sheet", "danger")
+            flash("请选择有效的池子 / 服务", "danger")
 
             return redirect(url_for("pool_select", upload_id=upload_id))
 
         analysis_request_started = perf_counter()
         try:
             load_started = perf_counter()
-            df = pd.read_excel(info["file_path"], sheet_name=sheet_name)
+            df = load_aggregated_group(info["file_path"], service_group)
             file_load_seconds = perf_counter() - load_started
             if df.empty:
-                raise ValueError("当前 sheet 没有可分析数据")
+                raise ValueError("当前池子 / 服务没有可分析数据")
 
             config_started = perf_counter()
             sensitivity = request.form.get("sensitivity", DEFAULT_SENSITIVITY).strip() or DEFAULT_SENSITIVITY
@@ -419,9 +468,13 @@ def create_app() -> Flask:
             session_payload = {
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "analysis_mode": "latency",
-                "file_name": f"{info['file_name']} (sheet: {sheet_name})",
+                "file_name": (
+                    f"{info['file_name']} "
+                    f"({service_group['infer_service_id']} / {service_group['service_name']})"
+                ),
                 "saved_path": info["file_path"],
-                "sheet_name": sheet_name,
+                "infer_service_id": service_group["infer_service_id"],
+                "service_name": service_group["service_name"],
                 "sensitivity_mode": sensitivity,
                 "sensitivity_mode_label": _latency_sensitivity_label(sensitivity),
                 "file_load_seconds": float(file_load_seconds),

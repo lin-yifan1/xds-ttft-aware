@@ -8,19 +8,19 @@
         <div class="card-body">
           <h5 class="card-title mb-2">选择要分析的池子 / 服务</h5>
           <p class="text-secondary mb-4">
-            当前文件：<strong>{{ file_name }}</strong>，共 <strong>{{ sheet_names|length }}</strong> 个 sheet。
-            请选择一个池子后进行 TTFT / TPOT 时延异常检测。
+            当前文件：<strong>{{ file_name }}</strong>，共 <strong>{{ service_group_count }}</strong> 个服务分组。
+            请选择一个池子和服务后进行 TTFT / TPOT 时延异常检测。
           </p>
 
           <form action="{{ url_for('pool_analyze', upload_id=upload_id) }}" method="post">
             <div class="mb-3">
-              <label class="form-label">池子 + service（按池子分组）</label>
-              <select class="form-select form-select-lg" name="sheet_name" required>
+              <label class="form-label">池子 + service</label>
+              <select class="form-select form-select-lg" name="group_id" required>
                 <option value="">请选择...</option>
-                {% for g in sheet_groups %}
+                {% for g in service_groups %}
                   <optgroup label="{{ g.pool_key }}">
                     {% for opt in g.options %}
-                      <option value="{{ opt.sheet_name }}">{{ opt.label }}</option>
+                      <option value="{{ opt.group_id }}">{{ opt.label }}（{{ opt.row_count }} 行）</option>
                     {% endfor %}
                   </optgroup>
                 {% endfor %}
@@ -70,7 +70,7 @@
         </div>
       </div>
       <div class="mt-3 text-center">
-        <a href="{{ url_for('pool_index') }}" class="text-secondary">重新上传其他 Excel</a>
+        <a href="{{ url_for('pool_index') }}" class="text-secondary">重新上传其他 SQLite</a>
       </div>
     </div>
   </div>

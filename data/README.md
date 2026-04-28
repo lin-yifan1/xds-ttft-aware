@@ -7,4 +7,4 @@
 - `code/process_data2_to_excel.py`
 - `code/aggregate_processed_metrics.py`
 
-生成可供网页上传分析的聚合 Excel。
+生成可供网页上传分析的聚合 SQLite。

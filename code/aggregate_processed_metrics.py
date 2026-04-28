@@ -1,25 +1,18 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
-import re
+from datetime import datetime, timezone
 from pathlib import Path
+import re
+import sqlite3
 
-import pandas as pd
+from config import AGGREGATED_SQLITE_PATH, DEFAULT_AGGREGATION_GRANULARITY, PROCESSED_SQLITE_PATH
+from process_data2_to_excel import SQL_COLUMNS, SQL_TABLE, cleanup_sqlite_files
 
-from config import (
-    AGGREGATE_CHECKPOINT_SHEETS,
-    AGGREGATE_MIN_GROUPS_FOR_PROGRESS,
-    AGGREGATE_PROGRESS_STEPS,
-    AGGREGATED_WORKBOOK_PATH,
-    AUTO_WORKER_CPU_EXTRA,
-    AUTO_WORKER_MAX,
-    DEFAULT_AGGREGATION_GRANULARITY,
-    PROCESSED_WORKBOOK_PATH,
-)
-
-OUTPUT_COLUMNS = [
+AGGREGATED_TABLE = "aggregated_metrics"
+AGGREGATED_COLUMNS = [
+    "infer_service_id",
+    "service_name",
     "domain_id",
     "rpm",
     "tpm",
@@ -29,22 +22,6 @@ OUTPUT_COLUMNS = [
     "completion_tokens",
     "collect_time_std",
 ]
-
-NUMERIC_COLUMNS = [
-    "rpm",
-    "tpm",
-    "ttft_avg",
-    "tpot_avg",
-    "prompt_tokens",
-    "completion_tokens",
-]
-
-def resolve_workers(workers: int, task_count: int) -> int:
-    if task_count <= 1:
-        return 1
-    if workers < 1:
-        return min(task_count, AUTO_WORKER_MAX, (os.cpu_count() or 1) + AUTO_WORKER_CPU_EXTRA)
-    return min(task_count, workers)
 
 
 def parse_bucket_freq(granularity: str) -> str:
@@ -74,214 +51,238 @@ def parse_bucket_freq(granularity: str) -> str:
     )
 
 
-def parse_time_column(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    s = out["collect_time_std"].astype(str).str.strip().str.replace(r"\s+", " ", regex=True)
-    parsed = pd.to_datetime(s, format="%Y-%m-%d %H:%M:%S", errors="coerce")
+def bucket_freq_to_seconds(bucket_freq: str) -> int:
+    if bucket_freq == "1h":
+        return 3600
 
-    fallback_mask = parsed.isna() & s.ne("") & s.notna()
-    if fallback_mask.any():
-        parsed.loc[fallback_mask] = pd.to_datetime(s.loc[fallback_mask], errors="coerce")
+    minute_match = re.fullmatch(r"([1-9]\d*)min", bucket_freq)
+    if minute_match:
+        return int(minute_match.group(1)) * 60
 
-    out["collect_time_std_parsed"] = parsed
-    out = out.dropna(subset=["collect_time_std_parsed"]).copy()
-    if out.empty:
-        raise ValueError("All collect_time_std values failed to parse.")
-    return out
+    raise ValueError(f"Unsupported parsed bucket frequency: {bucket_freq}")
 
 
-def weighted_average(values: pd.Series, weights: pd.Series) -> float:
-    values_num = pd.to_numeric(values, errors="coerce")
-    weights_num = pd.to_numeric(weights, errors="coerce").fillna(0.0)
-    valid = values_num.notna() & weights_num.notna() & (weights_num > 0)
-    if not valid.any():
-        return 0.0
-    return float((values_num[valid] * weights_num[valid]).sum() / weights_num[valid].sum())
+def validate_input_database(conn: sqlite3.Connection, input_path: Path) -> None:
+    table_exists = conn.execute(
+        "SELECT 1 FROM src.sqlite_master WHERE type = 'table' AND name = ?",
+        (SQL_TABLE,),
+    ).fetchone()
+    if not table_exists:
+        raise ValueError(f"SQLite input {input_path} does not contain table {SQL_TABLE!r}.")
+
+    columns = {str(row[1]) for row in conn.execute(f"PRAGMA src.table_info({SQL_TABLE})")}
+    missing = [col for col in SQL_COLUMNS if col not in columns]
+    if missing:
+        raise ValueError(f"SQLite input {input_path} is missing required columns: {missing}")
 
 
-def weighted_average_ignore_zero(values: pd.Series, weights: pd.Series) -> float:
-    values_num = pd.to_numeric(values, errors="coerce")
-    weights_num = pd.to_numeric(weights, errors="coerce").fillna(0.0)
-    valid = values_num.notna() & weights_num.notna() & (weights_num > 0) & (values_num != 0)
-    if not valid.any():
-        return 0.0
-    return float((values_num[valid] * weights_num[valid]).sum() / weights_num[valid].sum())
-
-
-def aggregate_one_sheet(df: pd.DataFrame, bucket_freq: str, progress_label: str = "") -> pd.DataFrame:
-    out = parse_time_column(df)
-    out["domain_id"] = out["domain_id"].fillna("").astype(str).str.strip()
-    out = out[out["domain_id"] != ""].copy()
-
-    for col in NUMERIC_COLUMNS:
-        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
-
-    out["bucket_time"] = out["collect_time_std_parsed"].dt.floor(bucket_freq)
-
-    grouped_rows: list[dict[str, object]] = []
-    group_cols = ["domain_id", "bucket_time"]
-    grouped = list(out.groupby(group_cols, sort=True))
-    total_groups = len(grouped)
-    label = f" {progress_label}" if progress_label else ""
-    print(f"[progress] sheet{label} groups={total_groups} bucket={bucket_freq}")
-    show_group_progress = total_groups >= AGGREGATE_MIN_GROUPS_FOR_PROGRESS
-    progress_interval = max(1, total_groups // AGGREGATE_PROGRESS_STEPS) if show_group_progress else 0
-    for idx, ((domain_id, bucket_time), g) in enumerate(grouped, start=1):
-        if show_group_progress and (idx % progress_interval == 0 or idx == total_groups):
-            percent = int(idx * 100 / total_groups)
-            print(f"[progress] sheet{label} groups {idx}/{total_groups} ({percent}%)")
-        rpm_sum = float(g["rpm"].sum())
-        tpm_sum = float(g["tpm"].sum())
-        grouped_rows.append(
-            {
-                "domain_id": domain_id,
-                "rpm": rpm_sum,
-                "tpm": tpm_sum,
-                "ttft_avg": weighted_average_ignore_zero(g["ttft_avg"], g["rpm"]),
-                "tpot_avg": weighted_average_ignore_zero(g["tpot_avg"], g["rpm"]),
-                "prompt_tokens": weighted_average(g["prompt_tokens"], g["rpm"]),
-                "completion_tokens": weighted_average(g["completion_tokens"], g["rpm"]),
-                "collect_time_std": pd.Timestamp(bucket_time).strftime("%Y-%m-%d %H:%M:%S"),
-            }
+def create_output_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {AGGREGATED_TABLE} (
+            infer_service_id TEXT NOT NULL,
+            service_name TEXT NOT NULL,
+            domain_id TEXT NOT NULL,
+            rpm REAL NOT NULL,
+            tpm REAL NOT NULL,
+            ttft_avg REAL NOT NULL,
+            tpot_avg REAL NOT NULL,
+            prompt_tokens REAL NOT NULL,
+            completion_tokens REAL NOT NULL,
+            collect_time_std TEXT NOT NULL
         )
-
-    result = pd.DataFrame(grouped_rows, columns=OUTPUT_COLUMNS)
-    if result.empty:
-        return result
-
-    result = result.sort_values(["domain_id", "collect_time_std"]).reset_index(drop=True)
-    return result
-
-
-def iter_workbook_batches(input_path: Path, batch_size: int):
-    if batch_size < 1:
-        raise ValueError("batch_size must be >= 1")
-
-    print(f"[progress] opening workbook {input_path}")
-    xl = pd.ExcelFile(input_path)
-    total_sheets = len(xl.sheet_names)
-    print(f"[progress] workbook sheets={total_sheets}")
-
-    batch: list[tuple[int, str, pd.DataFrame]] = []
-    for idx, sheet_name in enumerate(xl.sheet_names, start=1):
-        print(f"[progress] reading sheet {idx}/{total_sheets}: {sheet_name}")
-        frame = pd.read_excel(xl, sheet_name=sheet_name)
-        batch.append((idx, sheet_name, frame))
-        if len(batch) >= batch_size:
-            yield total_sheets, batch
-            batch = []
-
-    if batch:
-        yield total_sheets, batch
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE aggregation_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
 
 
-def write_sheet_batch(
-    writer: pd.ExcelWriter,
-    frames: list[tuple[int, str, pd.DataFrame]],
-    total_sheets: int,
-    checkpoint_path: Path,
-    sheets_written: int,
-) -> int:
-    for idx, sheet_name, frame in frames:
-        print(f"[progress] writing sheet {idx}/{total_sheets}: {sheet_name} rows={len(frame)}")
-        frame.to_excel(writer, sheet_name=sheet_name, index=False)
-        sheets_written += 1
+def insert_aggregated_rows(conn: sqlite3.Connection, bucket_seconds: int) -> None:
+    conn.execute(
+        f"""
+        INSERT INTO {AGGREGATED_TABLE} ({", ".join(AGGREGATED_COLUMNS)})
+        WITH bucketed AS (
+            SELECT
+                infer_service_id,
+                service_name,
+                domain_id,
+                rpm,
+                tpm,
+                ttft_avg,
+                tpot_avg,
+                prompt_tokens,
+                completion_tokens,
+                datetime(
+                    CAST(CAST(strftime('%s', collect_time_std) AS INTEGER) / ? AS INTEGER) * ?,
+                    'unixepoch'
+                ) AS bucket_time
+            FROM src.{SQL_TABLE}
+        ),
+        grouped AS (
+            SELECT
+                infer_service_id,
+                service_name,
+                domain_id,
+                bucket_time,
+                SUM(rpm) AS rpm_sum,
+                SUM(tpm) AS tpm_sum,
+                SUM(CASE WHEN rpm > 0 AND ttft_avg != 0 THEN ttft_avg * rpm ELSE 0 END) AS ttft_weighted_sum,
+                SUM(CASE WHEN rpm > 0 AND ttft_avg != 0 THEN rpm ELSE 0 END) AS ttft_weight_sum,
+                SUM(CASE WHEN rpm > 0 AND tpot_avg != 0 THEN tpot_avg * rpm ELSE 0 END) AS tpot_weighted_sum,
+                SUM(CASE WHEN rpm > 0 AND tpot_avg != 0 THEN rpm ELSE 0 END) AS tpot_weight_sum,
+                SUM(CASE WHEN rpm > 0 THEN prompt_tokens * rpm ELSE 0 END) AS prompt_weighted_sum,
+                SUM(CASE WHEN rpm > 0 THEN completion_tokens * rpm ELSE 0 END) AS completion_weighted_sum,
+                SUM(CASE WHEN rpm > 0 THEN rpm ELSE 0 END) AS token_weight_sum
+            FROM bucketed
+            WHERE
+                infer_service_id != ''
+                AND service_name != ''
+                AND domain_id != ''
+                AND bucket_time IS NOT NULL
+            GROUP BY infer_service_id, service_name, domain_id, bucket_time
+        )
+        SELECT
+            infer_service_id,
+            service_name,
+            domain_id,
+            rpm_sum,
+            tpm_sum,
+            CASE WHEN ttft_weight_sum > 0 THEN ttft_weighted_sum / ttft_weight_sum ELSE 0.0 END AS ttft_avg,
+            CASE WHEN tpot_weight_sum > 0 THEN tpot_weighted_sum / tpot_weight_sum ELSE 0.0 END AS tpot_avg,
+            CASE WHEN token_weight_sum > 0 THEN prompt_weighted_sum / token_weight_sum ELSE 0.0 END AS prompt_tokens,
+            CASE WHEN token_weight_sum > 0 THEN completion_weighted_sum / token_weight_sum ELSE 0.0 END AS completion_tokens,
+            bucket_time AS collect_time_std
+        FROM grouped
+        ORDER BY infer_service_id, service_name, domain_id, bucket_time
+        """,
+        (bucket_seconds, bucket_seconds),
+    )
 
-    writer.book.save(checkpoint_path)
-    print(f"[progress] checkpoint saved sheets={sheets_written}/{total_sheets} path={checkpoint_path}")
-    return sheets_written
+
+def create_indexes(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE INDEX idx_aggregated_group_order
+        ON {AGGREGATED_TABLE} (infer_service_id, service_name, domain_id, collect_time_std)
+        """
+    )
+    conn.execute(
+        f"""
+        CREATE INDEX idx_aggregated_group_lookup
+        ON {AGGREGATED_TABLE} (infer_service_id, service_name)
+        """
+    )
 
 
-def aggregate_sheet_task(
-    idx: int,
-    total: int,
-    sheet_name: str,
-    frame: pd.DataFrame,
+def insert_metadata(
+    conn: sqlite3.Connection,
+    input_path: Path,
     bucket_freq: str,
-) -> tuple[int, str, pd.DataFrame]:
-    print(f"[progress] sheet {idx}/{total} start rows={len(frame)} name={sheet_name}")
-    aggregated = aggregate_one_sheet(frame, bucket_freq, f"{idx}/{total}")
-    print(f"[progress] sheet {idx}/{total} done output_rows={len(aggregated)}")
-    return idx, sheet_name, aggregated
+    bucket_seconds: int,
+    source_rows: int,
+    output_rows: int,
+    service_groups: int,
+) -> None:
+    rows = {
+        "source_path": str(input_path),
+        "granularity": bucket_freq,
+        "bucket_seconds": str(bucket_seconds),
+        "source_rows": str(source_rows),
+        "output_rows": str(output_rows),
+        "service_groups": str(service_groups),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    conn.executemany(
+        "INSERT INTO aggregation_metadata (key, value) VALUES (?, ?)",
+        rows.items(),
+    )
 
 
-def aggregate_frames(
-    source_frames: list[tuple[int, str, pd.DataFrame]],
-    total_sheets: int,
-    bucket_freq: str,
-    workers: int,
-) -> list[tuple[int, str, pd.DataFrame]]:
-    max_workers = resolve_workers(workers, len(source_frames))
-    first_idx = source_frames[0][0]
-    last_idx = source_frames[-1][0]
-    print(f"[progress] aggregating sheet batch {first_idx}-{last_idx}/{total_sheets} workers={max_workers}")
-
-    if max_workers == 1:
-        frames: list[tuple[int, str, pd.DataFrame]] = []
-        for idx, sheet_name, frame in source_frames:
-            _, task_sheet_name, aggregated = aggregate_sheet_task(
-                idx,
-                total_sheets,
-                sheet_name,
-                frame,
-                bucket_freq,
-            )
-            frames.append((idx, task_sheet_name, aggregated))
-        return frames
-
-    results: list[tuple[int, str, pd.DataFrame]] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(
-                aggregate_sheet_task,
-                idx,
-                total_sheets,
-                sheet_name,
-                frame,
-                bucket_freq,
-            )
-            for idx, sheet_name, frame in source_frames
-        ]
-        for future in as_completed(futures):
-            idx, sheet_name, aggregated = future.result()
-            results.append((idx, sheet_name, aggregated))
-
-    return sorted(results, key=lambda item: item[0])
-
-
-def aggregate_workbook(input_path: Path, output_path: Path, granularity: str, workers: int = 0) -> Path:
+def aggregate_sqlite_database(input_path: Path, output_path: Path, granularity: str) -> Path:
     bucket_freq = parse_bucket_freq(granularity)
-    print(f"[progress] start aggregation input={input_path} output={output_path} bucket={bucket_freq}")
+    bucket_seconds = bucket_freq_to_seconds(bucket_freq)
+    input_path = input_path.resolve()
+    output_path = output_path.resolve()
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"SQLite input not found: {input_path}")
+    if input_path == output_path:
+        raise ValueError("Input and output SQLite paths must be different.")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_name(f"{output_path.stem}.tmp{output_path.suffix}")
-    if temp_path.exists():
-        temp_path.unlink()
+    cleanup_sqlite_files(temp_path)
 
-    sheets_written = 0
-    print(f"[progress] writing checkpoints every {AGGREGATE_CHECKPOINT_SHEETS} sheets")
-    with pd.ExcelWriter(temp_path, engine="openpyxl") as writer:
-        for total_sheets, source_frames in iter_workbook_batches(input_path, AGGREGATE_CHECKPOINT_SHEETS):
-            out_frames = aggregate_frames(source_frames, total_sheets, bucket_freq, workers)
-            sheets_written = write_sheet_batch(writer, out_frames, total_sheets, temp_path, sheets_written)
+    print(f"[progress] start sqlite aggregation input={input_path} output={output_path} bucket={bucket_freq}")
+    conn = sqlite3.connect(temp_path)
+    success = False
+    try:
+        conn.execute("PRAGMA journal_mode=OFF")
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA temp_store=FILE")
+        conn.execute("PRAGMA cache_size=-65536")
+        conn.execute("ATTACH DATABASE ? AS src", (str(input_path),))
+        validate_input_database(conn, input_path)
 
+        source_rows = int(conn.execute(f"SELECT COUNT(*) FROM src.{SQL_TABLE}").fetchone()[0])
+        service_groups = int(
+            conn.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM (
+                    SELECT 1
+                    FROM src.{SQL_TABLE}
+                    GROUP BY infer_service_id, service_name
+                )
+                """
+            ).fetchone()[0]
+        )
+        print(f"[progress] source rows={source_rows} service_groups={service_groups}")
+
+        create_output_schema(conn)
+        insert_aggregated_rows(conn, bucket_seconds)
+        create_indexes(conn)
+
+        output_rows = int(conn.execute(f"SELECT COUNT(*) FROM {AGGREGATED_TABLE}").fetchone()[0])
+        if output_rows == 0:
+            raise ValueError("No rows were produced by aggregation.")
+
+        insert_metadata(conn, input_path, bucket_freq, bucket_seconds, source_rows, output_rows, service_groups)
+        conn.commit()
+        conn.execute("DETACH DATABASE src")
+        success = True
+    finally:
+        conn.close()
+        if not success:
+            cleanup_sqlite_files(temp_path)
+
+    cleanup_sqlite_files(output_path)
     temp_path.replace(output_path)
-    print(f"[ok] wrote {output_path} sheets={sheets_written}")
+    print(f"[ok] wrote {output_path} rows={output_rows} service_groups={service_groups}")
     return output_path
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="Aggregate processed metrics workbook by configurable time buckets.")
-    ap.add_argument("--input", type=Path, default=PROCESSED_WORKBOOK_PATH, help="Input xlsx path.")
-    ap.add_argument("--output", type=Path, default=AGGREGATED_WORKBOOK_PATH, help="Output xlsx path.")
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Aggregate processed metrics SQLite by configurable time buckets.")
+    ap.add_argument("--input", type=Path, default=PROCESSED_SQLITE_PATH, help="Input processed SQLite path.")
+    ap.add_argument("--output", type=Path, default=AGGREGATED_SQLITE_PATH, help="Output aggregated SQLite path.")
     ap.add_argument(
         "--granularity",
         default=DEFAULT_AGGREGATION_GRANULARITY,
         help="Bucket size: 1h or any positive minute bucket, for example 1min, 5min, 10min, 30min.",
     )
-    ap.add_argument("--workers", type=int, default=0, help="Thread workers. Use 0 for auto, 1 to disable threading.")
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    aggregate_workbook(args.input, args.output, args.granularity, args.workers)
+
+def main() -> int:
+    args = parse_args()
+    aggregate_sqlite_database(args.input, args.output, args.granularity)
     return 0
 
 

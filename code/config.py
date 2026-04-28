@@ -18,46 +18,16 @@ RESULT_DIR = PROJECT_ROOT / "result"
 # Web 上传文件的临时保存目录。
 UPLOAD_DIR = PROJECT_ROOT / "_uploads"
 
-# 预处理后的多 sheet Excel 默认路径。
-PROCESSED_WORKBOOK_PATH = RESULT_DIR / "new_data_processed.xlsx"
+# 预处理后的 SQLite 明细库默认路径。
+PROCESSED_SQLITE_PATH = RESULT_DIR / "new_data_processed.sqlite"
 
-# 聚合后的多 sheet Excel 默认路径。
-AGGREGATED_WORKBOOK_PATH = RESULT_DIR / "new_data_aggregated.xlsx"
-
-# 自动线程数最多不超过该值。
-AUTO_WORKER_MAX = 32
-
-# 自动线程数会在 CPU 核数基础上额外加该值。
-AUTO_WORKER_CPU_EXTRA = 4
+# 聚合后的 SQLite 结果库默认路径。
+AGGREGATED_SQLITE_PATH = RESULT_DIR / "new_data_aggregated.sqlite"
 
 # 聚合脚本默认时间粒度。
 DEFAULT_AGGREGATION_GRANULARITY = "1h"
 
-# 聚合 group 数超过该值才打印百分比进度。
-AGGREGATE_MIN_GROUPS_FOR_PROGRESS = 1000
-
-# 聚合阶段按多少段打印百分比进度。
-AGGREGATE_PROGRESS_STEPS = 10
-
-# 聚合每处理多少个 sheet 保存一次临时 workbook。
-AGGREGATE_CHECKPOINT_SHEETS = 10
-
-# Excel sheet 名最大长度限制。
-EXCEL_SHEET_MAX_LEN = 31
-
-# sheet 名中服务 ID 部分的优先保留长度。
-SHEET_NAME_LEFT_BUDGET = 14
-
-# sheet 名空间不足时服务 ID 部分的回退长度。
-SHEET_NAME_FALLBACK_LEFT_BUDGET = 10
-
-# sheet 名中服务名部分至少保留的长度。
-SHEET_NAME_MIN_RIGHT_BUDGET = 6
-
-# 多 sheet 名称里连接池子和服务名的分隔符。
-SHEET_NAME_SEPARATOR = "__"
-
-# 标识“全部服务”sheet 的名称。
+# 标识“全部服务”的名称。
 POOL_ALL_MARKERS = frozenset({"ALL", "全部", "_ALL_"})
 
 # Web 下拉框中全部服务的展示名。

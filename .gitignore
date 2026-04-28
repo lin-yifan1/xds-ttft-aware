@@ -10,3 +10,4 @@ _uploads/
 *.log
 data2/
 result/**/*.xlsx
+result/**/*.sqlite
