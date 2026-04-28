@@ -13,6 +13,9 @@
       </div>
     </div>
     <div class="d-flex gap-2">
+      {% if pool_select_url %}
+        <a class="btn btn-outline-secondary" href="{{ pool_select_url }}">重选池子 / service</a>
+      {% endif %}
       <a class="btn btn-outline-secondary" href="{{ url_for('pool_index') }}">重新上传</a>
       <a class="btn btn-outline-primary" href="{{ url_for('export', session_id=session_id) }}">导出 CSV</a>
       <a class="btn btn-outline-primary" href="{{ url_for('export', session_id=session_id, format='json') }}">导出 JSON</a>

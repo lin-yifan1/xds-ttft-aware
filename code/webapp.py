@@ -52,6 +52,7 @@ from werkzeug.utils import secure_filename
 
 
 from config import (
+    AGGREGATED_SQLITE_PATH,
     CHART_MARGIN,
     CHART_TEMPLATE,
     CHART_WIDTH,
@@ -195,6 +196,38 @@ def _pool_upload_display_name(info: dict[str, Any]) -> str:
     return str(info.get("file_name", ""))
 
 
+def _display_project_path(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _default_database_context() -> dict[str, Any]:
+    path = AGGREGATED_SQLITE_PATH
+    exists = path.is_file()
+    stat = path.stat() if exists else None
+    return {
+        "path": str(path),
+        "display_name": _display_project_path(path),
+        "exists": exists,
+        "size_mb": (stat.st_size / 1024 / 1024) if stat else None,
+        "last_modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S") if stat else "",
+    }
+
+
+def _register_pool_database(app: Flask, db_path: Path, file_name: str, source: str) -> str:
+    service_groups = validate_aggregated_database(db_path)
+    upload_id = uuid.uuid4().hex
+    app.config["POOL_UPLOADS"][upload_id] = {
+        "file_path": str(db_path),
+        "file_name": file_name,
+        "service_groups": service_groups,
+        "source": source,
+    }
+    return upload_id
+
+
 def _latency_config_for_sensitivity(sensitivity: str, max_events: int) -> LatencyDetectorConfig:
     mode = (sensitivity or DEFAULT_SENSITIVITY).strip().lower()
     default_ratio = LATENCY_SENSITIVITY_RATIOS[DEFAULT_SENSITIVITY]
@@ -325,7 +358,7 @@ def create_app() -> Flask:
 
     def index():
 
-        return render_template("pool_upload.html")
+        return render_template("pool_upload.html", default_database=_default_database_context())
 
 
 
@@ -333,7 +366,7 @@ def create_app() -> Flask:
 
     def pool_index():
 
-        return render_template("pool_upload.html")
+        return render_template("pool_upload.html", default_database=_default_database_context())
 
 
 
@@ -343,8 +376,23 @@ def create_app() -> Flask:
         f_database = request.files.get("file_database")
         has_file = bool(f_database and f_database.filename)
         if not has_file:
-            flash("请先上传 SQLite 数据库文件", "danger")
-            return redirect(url_for("pool_index"))
+            default_path = AGGREGATED_SQLITE_PATH
+            if not default_path.is_file():
+                flash("默认 SQLite 不存在，请手动选择一个聚合 SQLite 数据库文件", "danger")
+                return redirect(url_for("pool_index"))
+
+            try:
+                upload_id = _register_pool_database(
+                    app,
+                    default_path,
+                    _display_project_path(default_path),
+                    "default",
+                )
+            except Exception as e:
+                flash(f"读取默认 SQLite 失败：{e}", "danger")
+                return redirect(url_for("pool_index"))
+
+            return redirect(url_for("pool_select", upload_id=upload_id))
 
         suffix = Path(f_database.filename).suffix.lower()
         if suffix not in SQLITE_INPUT_SUFFIXES:
@@ -357,16 +405,10 @@ def create_app() -> Flask:
         f_database.save(saved_path)
 
         try:
-            service_groups = validate_aggregated_database(saved_path)
+            upload_id = _register_pool_database(app, saved_path, filename, "upload")
         except Exception as e:
             flash(f"读取 SQLite 失败：{e}", "danger")
             return redirect(url_for("pool_index"))
-
-        app.config["POOL_UPLOADS"][upload_id] = {
-            "file_path": str(saved_path),
-            "file_name": filename,
-            "service_groups": service_groups,
-        }
 
         return redirect(url_for("pool_select", upload_id=upload_id))
 
@@ -473,6 +515,7 @@ def create_app() -> Flask:
                     f"({service_group['infer_service_id']} / {service_group['service_name']})"
                 ),
                 "saved_path": info["file_path"],
+                "upload_id": upload_id,
                 "infer_service_id": service_group["infer_service_id"],
                 "service_name": service_group["service_name"],
                 "sensitivity_mode": sensitivity,
@@ -630,6 +673,11 @@ def create_app() -> Flask:
         rendered = render_template(
             "results.html",
             session_id=session_id,
+            pool_select_url=(
+                url_for("pool_select", upload_id=s["upload_id"])
+                if s.get("upload_id") in app.config["POOL_UPLOADS"]
+                else None
+            ),
             file_name=s["file_name"],
             start_time=t[0].isoformat(timespec="minutes") if t else "",
             end_time=t[-1].isoformat(timespec="minutes") if t else "",

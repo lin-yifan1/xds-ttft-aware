@@ -6,7 +6,7 @@
     <div class="col-lg-8">
       <div class="card shadow-sm">
         <div class="card-body">
-          <h5 class="card-title mb-2">上传聚合结果 SQLite</h5>
+          <h5 class="card-title mb-2">确认聚合结果 SQLite</h5>
           <p class="text-secondary mb-4">
             上传 <code>code/aggregate_processed_metrics.py</code> 生成的聚合 SQLite 数据库。数据库中需要包含
             <code>aggregated_metrics</code> 表，以及 <code>infer_service_id</code>、<code>service_name</code>、
@@ -16,12 +16,43 @@
           </p>
 
           <form action="{{ url_for('pool_upload') }}" method="post" enctype="multipart/form-data">
+            {% if default_database.exists %}
+              <div class="border rounded bg-light p-3 mb-3">
+                <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+                  <div>
+                    <div class="fw-semibold">默认 SQLite</div>
+                    <code>{{ default_database.display_name }}</code>
+                  </div>
+                  <span class="badge text-bg-primary">已选中</span>
+                </div>
+                <div class="small text-secondary mt-2">
+                  大小：{{ "%.1f"|format(default_database.size_mb) }} MB · 更新时间：{{ default_database.last_modified }}
+                </div>
+              </div>
+            {% else %}
+              <div class="alert alert-warning">
+                未找到默认 SQLite：<code>{{ default_database.display_name }}</code>。请手动选择一个聚合 SQLite 文件。
+              </div>
+            {% endif %}
+
             <div class="mb-3">
-              <label class="form-label">聚合结果 SQLite</label>
-              <input class="form-control" type="file" name="file_database" accept=".sqlite,.sqlite3,.db,.s3db" required>
-              <div class="form-text">推荐上传 <code>result/new_data_aggregated.sqlite</code>。</div>
+              <label class="form-label">需要更换时选择其他 SQLite</label>
+              <input
+                class="form-control"
+                type="file"
+                name="file_database"
+                accept=".sqlite,.sqlite3,.db,.s3db"
+                {% if not default_database.exists %}required{% endif %}
+              >
+              <div class="form-text">
+                {% if default_database.exists %}
+                  不选择文件时，将直接使用默认 SQLite。
+                {% else %}
+                  支持 .sqlite / .sqlite3 / .db / .s3db。
+                {% endif %}
+              </div>
             </div>
-            <button class="btn btn-primary btn-lg w-100" type="submit">上传并选择池子</button>
+            <button class="btn btn-primary btn-lg w-100" type="submit">确认并选择池子</button>
           </form>
         </div>
       </div>
