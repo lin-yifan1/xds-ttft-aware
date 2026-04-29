@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 
@@ -166,34 +165,3 @@ DEFAULT_LATENCY_CONFIG = LatencyDetectorConfig()
 
 # 演示数据随机种子基准值。
 FAKE_DATA_SEED_BASE = 20260402
-
-# 演示数据起始时间。
-FAKE_DATA_START = datetime(2026, 3, 14, 4, 0, 0)
-
-# 演示数据生成场景。
-FAKE_DATA_SCENARIOS = [
-    {
-        "file_idx": 1,
-        "start_offset_hours": 0,
-        "hours": 10,
-        "infer_service_id": "svc-inference-main-cluster-east-long-name",
-        "service_name": "DeepSeek-R1-Reasoning-Service-Ultra-Long-Name",
-        "pool_id": "pool-A",
-    },
-    {
-        "file_idx": 2,
-        "start_offset_hours": 1,
-        "hours": 9,
-        "infer_service_id": "svc-inference-main-cluster-east-long-name",
-        "service_name": "DeepSeek-V3-Chat-Service-Ultra-Long-Name",
-        "pool_id": "pool-A",
-    },
-    {
-        "file_idx": 3,
-        "start_offset_hours": 0,
-        "hours": 8,
-        "infer_service_id": "svc-vision-prod",
-        "service_name": "Vision-Pro-Max",
-        "pool_id": "pool-B",
-    },
-]

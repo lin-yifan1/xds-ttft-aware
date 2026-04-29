@@ -184,12 +184,6 @@ class ChoiceTable:
         weights = normalize_weights([weight for _, weight in pairs])
         return cls(values=values, cumulative=np.cumsum(weights))
 
-    def pick(self, rng: np.random.Generator) -> object:
-        idx = int(np.searchsorted(self.cumulative, rng.random(), side="right"))
-        if idx >= len(self.values):
-            idx = len(self.values) - 1
-        return self.values[idx]
-
 
 @dataclass(frozen=True)
 class ServiceProfile:
@@ -237,19 +231,6 @@ class PartitionedCsvWriter:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close(finalize=exc_type is None)
-
-    def write_rows(self, rows: list[list[object]]) -> None:
-        start = 0
-        while start < len(rows):
-            if self.current_writer is None or self.rows_remaining == 0:
-                self._advance_to_next_writable_file()
-            if self.current_writer is None:
-                raise RuntimeError("No output files remain for generated rows.")
-
-            take = min(len(rows) - start, self.rows_remaining)
-            self.current_writer.writerows(rows[start : start + take])
-            self.rows_remaining -= take
-            start += take
 
     def write_columns(self, columns: dict[str, np.ndarray]) -> None:
         total = len(columns[CSV_HEADER[0]])
