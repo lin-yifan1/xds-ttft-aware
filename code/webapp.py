@@ -1011,6 +1011,61 @@ def build_timing_pie_figure(timing_items: list[dict[str, Any]]) -> go.Figure:
     return fig
 
 
+def _latency_axis_range_from_zero(*values: Any) -> list[float]:
+    max_value = 0.0
+    for value in values:
+        arr = np.asarray(value, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if finite.size:
+            max_value = max(max_value, float(np.max(finite)))
+    if max_value <= 0:
+        return [0.0, 1.0]
+    return [0.0, max_value * 1.05]
+
+
+def _latency_legend_layout() -> dict[str, dict[str, Any]]:
+    return {
+        "legend": dict(orientation="h", yanchor="bottom", y=1.15, xanchor="left", x=0, traceorder="normal"),
+        "legend2": dict(orientation="h", yanchor="bottom", y=1.08, xanchor="left", x=0, traceorder="normal"),
+    }
+
+
+def _add_latency_threshold_lines(
+    fig: go.Figure,
+    t: list[datetime],
+    ttft_sla: float,
+    tpot_sla: float,
+    ttft_severe: float,
+    tpot_severe: float,
+) -> None:
+    if not t:
+        return
+
+    x1 = t[-1] if len(t) > 1 else t[0] + timedelta(hours=1)
+    x = [t[0], x1]
+    specs = [
+        ("TTFT SLA", ttft_sla, "dash", "rgba(214,51,132,0.55)", False),
+        ("TTFT severe", ttft_severe, "dot", "rgba(214,51,132,0.85)", False),
+        ("TPOT SLA", tpot_sla, "dash", "rgba(253,126,20,0.55)", True),
+        ("TPOT severe", tpot_severe, "dot", "rgba(253,126,20,0.85)", True),
+    ]
+    for label, y, dash, color, secondary_y in specs:
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=[y, y],
+                mode="lines",
+                name=f"{label} ({y:g} ms)",
+                line=dict(color=color, dash=dash, width=2),
+                hovertemplate=f"{label}: {y:g} ms<extra></extra>",
+                legend="legend2",
+            ),
+            row=1,
+            col=1,
+            secondary_y=secondary_y,
+        )
+
+
 def build_latency_system_figure(
     t: list[datetime],
     system_ttft: Any,
@@ -1056,10 +1111,7 @@ def build_latency_system_figure(
         col=1,
         secondary_y=True,
     )
-    fig.add_hline(y=ttft_sla, line_dash="dash", line_color="rgba(214,51,132,0.55)", row=1, col=1, secondary_y=False)
-    fig.add_hline(y=ttft_severe, line_dash="dot", line_color="rgba(214,51,132,0.85)", row=1, col=1, secondary_y=False)
-    fig.add_hline(y=tpot_sla, line_dash="dash", line_color="rgba(253,126,20,0.55)", row=1, col=1, secondary_y=True)
-    fig.add_hline(y=tpot_severe, line_dash="dot", line_color="rgba(253,126,20,0.85)", row=1, col=1, secondary_y=True)
+    _add_latency_threshold_lines(fig, t, ttft_sla, tpot_sla, ttft_severe, tpot_severe)
 
     ttft_idx = np.where(sys_anom_ttft)[0]
     if ttft_idx.size:
@@ -1117,8 +1169,20 @@ def build_latency_system_figure(
                 col=1,
             )
 
-    fig.update_yaxes(title_text="TTFT (ms)", row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="TPOT (ms)", row=1, col=1, secondary_y=True)
+    fig.update_yaxes(
+        title_text="TTFT (ms)",
+        range=_latency_axis_range_from_zero(system_ttft, ttft_sla, ttft_severe),
+        row=1,
+        col=1,
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="TPOT (ms)",
+        range=_latency_axis_range_from_zero(system_tpot, tpot_sla, tpot_severe),
+        row=1,
+        col=1,
+        secondary_y=True,
+    )
     fig.update_yaxes(title_text="RPM", row=2, col=1, secondary_y=False)
     fig.update_yaxes(title_text="TPM", row=2, col=1, secondary_y=True)
     fig.update_xaxes(title_text="时间", row=2, col=1)
@@ -1126,8 +1190,8 @@ def build_latency_system_figure(
         template=CHART_TEMPLATE,
         width=CHART_WIDTH,
         height=SYSTEM_CHART_HEIGHT,
-        margin={**CHART_MARGIN, "t": 72},
-        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0),
+        margin={**CHART_MARGIN, "t": 116},
+        **_latency_legend_layout(),
     )
     return fig
 
@@ -1179,10 +1243,7 @@ def build_latency_user_figure(
         col=1,
         secondary_y=True,
     )
-    fig.add_hline(y=ttft_sla, line_dash="dash", line_color="rgba(214,51,132,0.55)", row=1, col=1, secondary_y=False)
-    fig.add_hline(y=ttft_severe, line_dash="dot", line_color="rgba(214,51,132,0.85)", row=1, col=1, secondary_y=False)
-    fig.add_hline(y=tpot_sla, line_dash="dash", line_color="rgba(253,126,20,0.55)", row=1, col=1, secondary_y=True)
-    fig.add_hline(y=tpot_severe, line_dash="dot", line_color="rgba(253,126,20,0.85)", row=1, col=1, secondary_y=True)
+    _add_latency_threshold_lines(fig, t, ttft_sla, tpot_sla, ttft_severe, tpot_severe)
 
     hit_idx = np.where(flags)[0]
     if hit_idx.size:
@@ -1238,8 +1299,20 @@ def build_latency_user_figure(
                 col=1,
             )
 
-    fig.update_yaxes(title_text="TTFT (ms)", row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="TPOT (ms)", row=1, col=1, secondary_y=True)
+    fig.update_yaxes(
+        title_text="TTFT (ms)",
+        range=_latency_axis_range_from_zero(ttft, ttft_sla, ttft_severe),
+        row=1,
+        col=1,
+        secondary_y=False,
+    )
+    fig.update_yaxes(
+        title_text="TPOT (ms)",
+        range=_latency_axis_range_from_zero(tpot, tpot_sla, tpot_severe),
+        row=1,
+        col=1,
+        secondary_y=True,
+    )
     fig.update_yaxes(title_text="RPM", row=2, col=1, secondary_y=False)
     fig.update_yaxes(title_text="TPM", row=2, col=1, secondary_y=True)
     fig.update_yaxes(title_text="Prompt", row=3, col=1, secondary_y=False)
@@ -1249,8 +1322,8 @@ def build_latency_user_figure(
         template=CHART_TEMPLATE,
         width=CHART_WIDTH,
         height=USER_CHART_HEIGHT,
-        margin=CHART_MARGIN,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin={**CHART_MARGIN, "t": 116},
+        **_latency_legend_layout(),
     )
     return fig
 
