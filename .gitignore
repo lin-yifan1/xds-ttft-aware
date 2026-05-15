@@ -8,6 +8,8 @@ _uploads/
 .mypy_cache/
 .ruff_cache/
 *.log
-data2/
+data2/*
+!data2/
+!data2/README.md
 result/**/*.xlsx
 result/**/*.sqlite
