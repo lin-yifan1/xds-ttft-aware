@@ -397,57 +397,89 @@ def _first_positive_index(values: np.ndarray) -> int:
     return int(idx[0])
 
 
-def detect_latency_anomalies(cfg: LatencyDetectorConfig, df: pd.DataFrame) -> dict[str, Any]:
-    detection_started = perf_counter()
-
-    prepare_started = perf_counter()
+def _prepare_latency_frame(df: pd.DataFrame) -> pd.DataFrame:
     prepared = validate_latency_input(df)
-    prepare_input_seconds = perf_counter() - prepare_started
-
-    dedupe_started = perf_counter()
     prepared = _collapse_duplicate_rows(prepared)
-    prepared = prepared.sort_values(["domain_id", "collect_time_std_parsed"]).reset_index(drop=True)
-    dedupe_seconds = perf_counter() - dedupe_started
+    return prepared.sort_values(["domain_id", "collect_time_std_parsed"]).reset_index(drop=True)
 
-    time_index_started = perf_counter()
-    user_ids = sorted(prepared["domain_id"].astype(str).unique().tolist())
-    base_time_index = pd.Series(sorted(pd.unique(prepared["collect_time_std_parsed"])))
-    freq = _infer_time_freq(base_time_index)
-    time_index = pd.date_range(start=base_time_index.min(), end=base_time_index.max(), freq=freq)
-    time_index_seconds = perf_counter() - time_index_started
 
-    matrix_started = perf_counter()
-    rpm_matrix = _build_metric_matrix(prepared, user_ids, time_index, "rpm")
-    tpm_matrix = _build_metric_matrix(prepared, user_ids, time_index, "tpm")
-    ttft_matrix = _build_metric_matrix(prepared, user_ids, time_index, "ttft_avg")
-    tpot_matrix = _build_metric_matrix(prepared, user_ids, time_index, "tpot_avg")
-    prompt_matrix = _build_metric_matrix(prepared, user_ids, time_index, "prompt_tokens")
-    completion_matrix = _build_metric_matrix(prepared, user_ids, time_index, "completion_tokens")
-    matrix_build_seconds = perf_counter() - matrix_started
+def _empty_prepared_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=[
+            "domain_id",
+            "collect_time_std_parsed",
+            "rpm",
+            "tpm",
+            "ttft_avg",
+            "tpot_avg",
+            "prompt_tokens",
+            "completion_tokens",
+        ]
+    )
 
-    system_series_started = perf_counter()
+
+def _prepare_optional_latency_frame(df: pd.DataFrame | None) -> pd.DataFrame:
+    if df is None or df.empty:
+        return _empty_prepared_frame()
+    return _prepare_latency_frame(df)
+
+
+def _build_metric_matrices(
+    prepared: pd.DataFrame,
+    user_ids: list[str],
+    time_index: pd.DatetimeIndex,
+) -> dict[str, np.ndarray]:
+    return {
+        "rpm": _build_metric_matrix(prepared, user_ids, time_index, "rpm"),
+        "tpm": _build_metric_matrix(prepared, user_ids, time_index, "tpm"),
+        "ttft": _build_metric_matrix(prepared, user_ids, time_index, "ttft_avg"),
+        "tpot": _build_metric_matrix(prepared, user_ids, time_index, "tpot_avg"),
+        "prompt_tokens": _build_metric_matrix(prepared, user_ids, time_index, "prompt_tokens"),
+        "completion_tokens": _build_metric_matrix(prepared, user_ids, time_index, "completion_tokens"),
+    }
+
+
+def _build_system_series(matrices: dict[str, np.ndarray], point_count: int) -> dict[str, np.ndarray]:
+    rpm_matrix = matrices["rpm"]
+    tpm_matrix = matrices["tpm"]
+    ttft_matrix = matrices["ttft"]
+    tpot_matrix = matrices["tpot"]
+    prompt_matrix = matrices["prompt_tokens"]
+    completion_matrix = matrices["completion_tokens"]
+
     system_rpm = rpm_matrix.sum(axis=0)
     system_tpm = tpm_matrix.sum(axis=0)
-
     system_ttft = np.array(
-        [_weighted_average_ignore_zero_1d(ttft_matrix[:, i], rpm_matrix[:, i]) for i in range(len(time_index))],
+        [_weighted_average_ignore_zero_1d(ttft_matrix[:, i], rpm_matrix[:, i]) for i in range(point_count)],
         dtype=float,
     )
     system_tpot = np.array(
-        [_weighted_average_ignore_zero_1d(tpot_matrix[:, i], rpm_matrix[:, i]) for i in range(len(time_index))],
+        [_weighted_average_ignore_zero_1d(tpot_matrix[:, i], rpm_matrix[:, i]) for i in range(point_count)],
         dtype=float,
     )
     system_prompt = np.array(
-        [_weighted_average_1d(prompt_matrix[:, i], rpm_matrix[:, i]) for i in range(len(time_index))],
+        [_weighted_average_1d(prompt_matrix[:, i], rpm_matrix[:, i]) for i in range(point_count)],
         dtype=float,
     )
     system_completion = np.array(
-        [_weighted_average_1d(completion_matrix[:, i], rpm_matrix[:, i]) for i in range(len(time_index))],
+        [_weighted_average_1d(completion_matrix[:, i], rpm_matrix[:, i]) for i in range(point_count)],
         dtype=float,
     )
-    system_series_seconds = perf_counter() - system_series_started
+    return {
+        "system_rpm": system_rpm,
+        "system_tpm": system_tpm,
+        "system_ttft": system_ttft,
+        "system_tpot": system_tpot,
+        "system_prompt": system_prompt,
+        "system_completion": system_completion,
+    }
 
-    event_detection_started = perf_counter()
+
+def _detect_system_events(
+    cfg: LatencyDetectorConfig,
+    system_ttft: np.ndarray,
+    system_tpot: np.ndarray,
+) -> dict[str, Any]:
     ttft_heavy = system_ttft >= (cfg.ttft_sla * cfg.severe_ratio)
     tpot_heavy = system_tpot >= (cfg.tpot_sla * cfg.severe_ratio)
     ttft_mild = system_ttft > cfg.ttft_sla
@@ -463,44 +495,203 @@ def detect_latency_anomalies(cfg: LatencyDetectorConfig, df: pd.DataFrame) -> di
     sys_event_mask = np.zeros_like(sys_anom, dtype=bool)
     for a, b in events:
         sys_event_mask[a : b + 1] = True
+    return {
+        "sys_anom": sys_anom,
+        "sys_anom_ttft": sys_anom_ttft,
+        "sys_anom_tpot": sys_anom_tpot,
+        "sys_event_mask": sys_event_mask,
+        "events": events,
+    }
+
+
+def _rolling_matrix_baseline(matrix: np.ndarray, cfg: LatencyDetectorConfig) -> np.ndarray:
+    if matrix.shape[0] == 0:
+        return np.zeros_like(matrix, dtype=float)
+    baseline = np.vstack(
+        [_rolling_mean(matrix[i], cfg.baseline_window_points, cfg.min_baseline_points) for i in range(matrix.shape[0])]
+    )
+    return np.nan_to_num(baseline, nan=0.0)
+
+
+def _rolling_baselines(
+    cfg: LatencyDetectorConfig,
+    matrices: dict[str, np.ndarray],
+    system: dict[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    baselines = {
+        "rpm": _rolling_matrix_baseline(matrices["rpm"], cfg),
+        "tpm": _rolling_matrix_baseline(matrices["tpm"], cfg),
+        "prompt_tokens": _rolling_matrix_baseline(matrices["prompt_tokens"], cfg),
+        "completion_tokens": _rolling_matrix_baseline(matrices["completion_tokens"], cfg),
+    }
+    system_baselines = {
+        "system_rpm": np.nan_to_num(_rolling_mean(system["system_rpm"], cfg.baseline_window_points, cfg.min_baseline_points), nan=0.0),
+        "system_tpm": np.nan_to_num(_rolling_mean(system["system_tpm"], cfg.baseline_window_points, cfg.min_baseline_points), nan=0.0),
+        "system_prompt": np.nan_to_num(
+            _rolling_mean(system["system_prompt"], cfg.baseline_window_points, cfg.min_baseline_points),
+            nan=0.0,
+        ),
+        "system_completion": np.nan_to_num(
+            _rolling_mean(system["system_completion"], cfg.baseline_window_points, cfg.min_baseline_points),
+            nan=0.0,
+        ),
+    }
+    return baselines, system_baselines
+
+
+def _minute_offsets_from_anchor(times: pd.Series | pd.DatetimeIndex, reported_at: Any) -> np.ndarray:
+    ts = pd.to_datetime(pd.Series(times), errors="coerce").dt.floor("min")
+    anchor = pd.Timestamp(reported_at).floor("min")
+    anchor_seconds = anchor.hour * 3600 + anchor.minute * 60 + anchor.second
+    anchors = ts.dt.normalize() + pd.to_timedelta(anchor_seconds, unit="s")
+    return np.floor((ts - anchors).dt.total_seconds().to_numpy(dtype=float) / 60.0).astype(int)
+
+
+def _historical_baselines_by_offset(
+    cfg: LatencyDetectorConfig,
+    history: pd.DataFrame,
+    user_ids: list[str],
+    time_index: pd.DatetimeIndex,
+    reported_at: Any,
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    point_count = len(time_index)
+    baselines = {
+        "rpm": np.zeros((len(user_ids), point_count), dtype=float),
+        "tpm": np.zeros((len(user_ids), point_count), dtype=float),
+        "prompt_tokens": np.zeros((len(user_ids), point_count), dtype=float),
+        "completion_tokens": np.zeros((len(user_ids), point_count), dtype=float),
+    }
+    system_baselines = {
+        "system_rpm": np.zeros(point_count, dtype=float),
+        "system_tpm": np.zeros(point_count, dtype=float),
+        "system_prompt": np.zeros(point_count, dtype=float),
+        "system_completion": np.zeros(point_count, dtype=float),
+    }
+    if history.empty or not user_ids or point_count == 0:
+        return baselines, system_baselines
+
+    hist = history.copy()
+    hist["_offset_min"] = _minute_offsets_from_anchor(hist["collect_time_std_parsed"], reported_at)
+    current_offsets = _minute_offsets_from_anchor(time_index, reported_at)
+    user_pos = {uid: idx for idx, uid in enumerate(user_ids)}
+
+    for metric, column in (
+        ("rpm", "rpm"),
+        ("tpm", "tpm"),
+        ("prompt_tokens", "prompt_tokens"),
+        ("completion_tokens", "completion_tokens"),
+    ):
+        grouped = (
+            hist.groupby(["domain_id", "_offset_min"], sort=False)[column]
+            .agg(["mean", "count"])
+            .reset_index()
+        )
+        for _, row in grouped.iterrows():
+            if int(row["count"]) < cfg.min_baseline_points:
+                continue
+            uid = str(row["domain_id"])
+            if uid not in user_pos:
+                continue
+            cols = np.where(current_offsets == int(row["_offset_min"]))[0]
+            if cols.size:
+                baselines[metric][user_pos[uid], cols] = float(row["mean"])
+
+    time_grouped = (
+        hist.groupby("collect_time_std_parsed", sort=True)
+        .agg(
+            rpm=("rpm", "sum"),
+            tpm=("tpm", "sum"),
+            prompt_tokens=("prompt_tokens", lambda s: _weighted_average_1d(s.to_numpy(dtype=float), hist.loc[s.index, "rpm"].to_numpy(dtype=float))),
+            completion_tokens=(
+                "completion_tokens",
+                lambda s: _weighted_average_1d(s.to_numpy(dtype=float), hist.loc[s.index, "rpm"].to_numpy(dtype=float)),
+            ),
+        )
+        .reset_index()
+    )
+    time_grouped["_offset_min"] = _minute_offsets_from_anchor(time_grouped["collect_time_std_parsed"], reported_at)
+    for out_key, column in (
+        ("system_rpm", "rpm"),
+        ("system_tpm", "tpm"),
+        ("system_prompt", "prompt_tokens"),
+        ("system_completion", "completion_tokens"),
+    ):
+        grouped = time_grouped.groupby("_offset_min", sort=False)[column].agg(["mean", "count"]).reset_index()
+        for _, row in grouped.iterrows():
+            if int(row["count"]) < cfg.min_baseline_points:
+                continue
+            cols = np.where(current_offsets == int(row["_offset_min"]))[0]
+            if cols.size:
+                system_baselines[out_key][cols] = float(row["mean"])
+
+    return baselines, system_baselines
+
+
+def _first_active_indices(
+    matrices: dict[str, np.ndarray],
+    user_ids: list[str],
+    history: pd.DataFrame | None = None,
+) -> np.ndarray:
+    active_before = set()
+    if history is not None and not history.empty:
+        activity = history.groupby("domain_id", sort=False).apply(lambda g: bool(((g["rpm"] + g["tpm"]) > 0).any()))
+        active_before = {str(uid) for uid, is_active in activity.items() if is_active}
+
+    out = []
+    for idx, uid in enumerate(user_ids):
+        if str(uid) in active_before:
+            out.append(-1)
+        else:
+            out.append(_first_positive_index(matrices["rpm"][idx] + matrices["tpm"][idx]))
+    return np.asarray(out, dtype=int)
+
+
+def _run_latency_detection_core(
+    cfg: LatencyDetectorConfig,
+    time_index: pd.DatetimeIndex,
+    freq: pd.Timedelta,
+    user_ids: list[str],
+    matrices: dict[str, np.ndarray],
+    system: dict[str, np.ndarray],
+    baselines: dict[str, np.ndarray],
+    system_baselines: dict[str, np.ndarray],
+    first_active_hours: np.ndarray,
+    detection_started: float,
+    timings: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    timings = dict(timings or {})
+
+    rpm_matrix = matrices["rpm"]
+    tpm_matrix = matrices["tpm"]
+    ttft_matrix = matrices["ttft"]
+    tpot_matrix = matrices["tpot"]
+    prompt_matrix = matrices["prompt_tokens"]
+    completion_matrix = matrices["completion_tokens"]
+
+    system_rpm = system["system_rpm"]
+    system_tpm = system["system_tpm"]
+    system_ttft = system["system_ttft"]
+    system_tpot = system["system_tpot"]
+    system_prompt = system["system_prompt"]
+    system_completion = system["system_completion"]
+
+    baseline_rpm = baselines["rpm"]
+    baseline_tpm = baselines["tpm"]
+    baseline_prompt = baselines["prompt_tokens"]
+    baseline_completion = baselines["completion_tokens"]
+    system_baseline_rpm = system_baselines["system_rpm"]
+    system_baseline_tpm = system_baselines["system_tpm"]
+    system_baseline_prompt = system_baselines["system_prompt"]
+    system_baseline_completion = system_baselines["system_completion"]
+
+    event_detection_started = perf_counter()
+    event_info = _detect_system_events(cfg, system_ttft, system_tpot)
+    sys_anom = event_info["sys_anom"]
+    sys_anom_ttft = event_info["sys_anom_ttft"]
+    sys_anom_tpot = event_info["sys_anom_tpot"]
+    sys_event_mask = event_info["sys_event_mask"]
+    events = event_info["events"]
     event_detection_seconds = perf_counter() - event_detection_started
-
-    baseline_started = perf_counter()
-    baseline_rpm = np.vstack(
-        [_rolling_mean(rpm_matrix[i], cfg.baseline_window_points, cfg.min_baseline_points) for i in range(len(user_ids))]
-    )
-    baseline_tpm = np.vstack(
-        [_rolling_mean(tpm_matrix[i], cfg.baseline_window_points, cfg.min_baseline_points) for i in range(len(user_ids))]
-    )
-    baseline_prompt = np.vstack(
-        [_rolling_mean(prompt_matrix[i], cfg.baseline_window_points, cfg.min_baseline_points) for i in range(len(user_ids))]
-    )
-    baseline_completion = np.vstack(
-        [
-            _rolling_mean(completion_matrix[i], cfg.baseline_window_points, cfg.min_baseline_points)
-            for i in range(len(user_ids))
-        ]
-    )
-    baseline_rpm = np.nan_to_num(baseline_rpm, nan=0.0)
-    baseline_tpm = np.nan_to_num(baseline_tpm, nan=0.0)
-    baseline_prompt = np.nan_to_num(baseline_prompt, nan=0.0)
-    baseline_completion = np.nan_to_num(baseline_completion, nan=0.0)
-    baseline_seconds = perf_counter() - baseline_started
-
-    system_baseline_rpm = np.nan_to_num(_rolling_mean(system_rpm, cfg.baseline_window_points, cfg.min_baseline_points), nan=0.0)
-    system_baseline_tpm = np.nan_to_num(_rolling_mean(system_tpm, cfg.baseline_window_points, cfg.min_baseline_points), nan=0.0)
-    system_baseline_prompt = np.nan_to_num(
-        _rolling_mean(system_prompt, cfg.baseline_window_points, cfg.min_baseline_points),
-        nan=0.0,
-    )
-    system_baseline_completion = np.nan_to_num(
-        _rolling_mean(system_completion, cfg.baseline_window_points, cfg.min_baseline_points),
-        nan=0.0,
-    )
-    first_active_hours = np.array(
-        [_first_positive_index(rpm_matrix[i] + tpm_matrix[i]) for i in range(len(user_ids))],
-        dtype=int,
-    )
 
     flags = np.zeros_like(rpm_matrix, dtype=bool)
     event_reports: list[dict[str, Any]] = []
@@ -739,13 +930,13 @@ def detect_latency_anomalies(cfg: LatencyDetectorConfig, df: pd.DataFrame) -> di
     }
     stats_seconds = perf_counter() - stats_started
     detection_timings = {
-        "prepare_input_seconds": float(prepare_input_seconds),
-        "dedupe_seconds": float(dedupe_seconds),
-        "time_index_seconds": float(time_index_seconds),
-        "matrix_build_seconds": float(matrix_build_seconds),
-        "system_series_seconds": float(system_series_seconds),
+        "prepare_input_seconds": float(timings.get("prepare_input_seconds", 0.0)),
+        "dedupe_seconds": float(timings.get("dedupe_seconds", 0.0)),
+        "time_index_seconds": float(timings.get("time_index_seconds", 0.0)),
+        "matrix_build_seconds": float(timings.get("matrix_build_seconds", 0.0)),
+        "system_series_seconds": float(timings.get("system_series_seconds", 0.0)),
         "event_detection_seconds": float(event_detection_seconds),
-        "baseline_seconds": float(baseline_seconds),
+        "baseline_seconds": float(timings.get("baseline_seconds", 0.0)),
         "rootcause_seconds": float(rootcause_seconds),
         "records_seconds": float(records_seconds),
         "stats_seconds": float(stats_seconds),
@@ -780,3 +971,137 @@ def detect_latency_anomalies(cfg: LatencyDetectorConfig, df: pd.DataFrame) -> di
         "config_echo": asdict(cfg),
         "detection_timings": detection_timings,
     }
+
+
+def detect_latency_anomalies(cfg: LatencyDetectorConfig, df: pd.DataFrame) -> dict[str, Any]:
+    detection_started = perf_counter()
+
+    prepare_started = perf_counter()
+    prepared = validate_latency_input(df)
+    prepare_input_seconds = perf_counter() - prepare_started
+
+    dedupe_started = perf_counter()
+    prepared = _collapse_duplicate_rows(prepared)
+    prepared = prepared.sort_values(["domain_id", "collect_time_std_parsed"]).reset_index(drop=True)
+    dedupe_seconds = perf_counter() - dedupe_started
+
+    time_index_started = perf_counter()
+    user_ids = sorted(prepared["domain_id"].astype(str).unique().tolist())
+    base_time_index = pd.Series(sorted(pd.unique(prepared["collect_time_std_parsed"])))
+    freq = _infer_time_freq(base_time_index)
+    time_index = pd.date_range(start=base_time_index.min(), end=base_time_index.max(), freq=freq)
+    time_index_seconds = perf_counter() - time_index_started
+
+    matrix_started = perf_counter()
+    matrices = _build_metric_matrices(prepared, user_ids, time_index)
+    matrix_build_seconds = perf_counter() - matrix_started
+
+    system_series_started = perf_counter()
+    system = _build_system_series(matrices, len(time_index))
+    system_series_seconds = perf_counter() - system_series_started
+
+    baseline_started = perf_counter()
+    baselines, system_baselines = _rolling_baselines(cfg, matrices, system)
+    first_active_hours = _first_active_indices(matrices, user_ids)
+    baseline_seconds = perf_counter() - baseline_started
+
+    return _run_latency_detection_core(
+        cfg,
+        time_index,
+        freq,
+        user_ids,
+        matrices,
+        system,
+        baselines,
+        system_baselines,
+        first_active_hours,
+        detection_started,
+        {
+            "prepare_input_seconds": prepare_input_seconds,
+            "dedupe_seconds": dedupe_seconds,
+            "time_index_seconds": time_index_seconds,
+            "matrix_build_seconds": matrix_build_seconds,
+            "system_series_seconds": system_series_seconds,
+            "baseline_seconds": baseline_seconds,
+        },
+    )
+
+
+def detect_latency_anomalies_with_history(
+    cfg: LatencyDetectorConfig,
+    current_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    reported_at: Any,
+    window_before_minutes: int = 10,
+    window_after_minutes: int = 10,
+) -> dict[str, Any]:
+    detection_started = perf_counter()
+
+    prepare_started = perf_counter()
+    current_prepared = _prepare_latency_frame(current_df)
+    history_prepared = _prepare_optional_latency_frame(history_df)
+    prepare_input_seconds = perf_counter() - prepare_started
+
+    time_index_started = perf_counter()
+    reported = pd.Timestamp(reported_at).floor("min")
+    window_start = reported - pd.Timedelta(minutes=int(window_before_minutes))
+    window_points = int(window_before_minutes) + int(window_after_minutes)
+    if window_points <= 0:
+        raise ValueError("history comparison window must contain at least one minute")
+    time_index = pd.date_range(start=window_start, periods=window_points, freq="1min")
+    freq = pd.Timedelta(minutes=1)
+    user_ids = sorted(
+        set(current_prepared["domain_id"].astype(str).unique().tolist())
+        | set(history_prepared["domain_id"].astype(str).unique().tolist())
+    )
+    if not user_ids:
+        raise ValueError("No valid users remained after preparing current and history data.")
+    time_index_seconds = perf_counter() - time_index_started
+
+    matrix_started = perf_counter()
+    matrices = _build_metric_matrices(current_prepared, user_ids, time_index)
+    matrix_build_seconds = perf_counter() - matrix_started
+
+    system_series_started = perf_counter()
+    system = _build_system_series(matrices, len(time_index))
+    system_series_seconds = perf_counter() - system_series_started
+
+    baseline_started = perf_counter()
+    baselines, system_baselines = _historical_baselines_by_offset(
+        cfg,
+        history_prepared,
+        user_ids,
+        time_index,
+        reported,
+    )
+    first_active_hours = _first_active_indices(matrices, user_ids, history_prepared)
+    baseline_seconds = perf_counter() - baseline_started
+
+    result = _run_latency_detection_core(
+        cfg,
+        time_index,
+        freq,
+        user_ids,
+        matrices,
+        system,
+        baselines,
+        system_baselines,
+        first_active_hours,
+        detection_started,
+        {
+            "prepare_input_seconds": prepare_input_seconds,
+            "dedupe_seconds": 0.0,
+            "time_index_seconds": time_index_seconds,
+            "matrix_build_seconds": matrix_build_seconds,
+            "system_series_seconds": system_series_seconds,
+            "baseline_seconds": baseline_seconds,
+        },
+    )
+    result["history_baseline"] = {
+        "history_rows": int(len(history_prepared)),
+        "current_rows": int(len(current_prepared)),
+        "window_before_minutes": int(window_before_minutes),
+        "window_after_minutes": int(window_after_minutes),
+        "reported_at": reported.to_pydatetime().isoformat(timespec="minutes"),
+    }
+    return result
