@@ -158,3 +158,36 @@ uv run python -m unittest code.test_alert_aggregator code.test_alert_service
 ```powershell
 uv run python code/maas_monitor_cli.py --reported-at ... --infer-service-id ...
 ```
+
+## 8. 仓库文档索引
+
+仓库内的 Markdown 文档按用途分四组。如不确定从哪份开始，建议顺序：**[分析.md](分析.md)（概览） → [ANOMALY_DETECTION_LOGIC.md](ANOMALY_DETECTION_LOGIC.md)（速查卡 + 与工作流图对照） → [异常检测.md](异常检测.md)（完整参考）**。
+
+### 8.1 算法说明（按"读多深"递进）
+
+| 文档 | 定位 | 适合读者 |
+| --- | --- | --- |
+| [分析.md](分析.md) | 高层概览：一句话结论、主流程框图、事件检测 / 根因 / 诱因逻辑的简要描述 | 第一次接触本项目、想快速建立心智模型 |
+| [ANOMALY_DETECTION_LOGIC.md](ANOMALY_DETECTION_LOGIC.md) | 简版权威说明 + 与"过载溯源工作流图"逐方框对照表，文末第 11 节给出图→代码符号的完整映射 | 想确认代码是否对齐设计文档、做 code review、写算法对照 |
+| [异常检测.md](异常检测.md) | 完整章节式参考：输入格式 / 预处理 / 矩阵构建 / 系统序列 / 事件判定 / 基线 / 根因评分 / culprit / 诱因 / 新用户加入 / 输出字段 / 耗时统计 | 修改 `latency_detector.py` 或新增参数前的详尽对照 |
+
+三份算法文档以 [code/latency_detector.py](code/latency_detector.py) 实现为准。文档之间存在重叠，但视角不同——分析.md 偏"为什么这样设计"，ANOMALY_DETECTION_LOGIC.md 偏"代码到底做了什么"，异常检测.md 偏"每个字段的精确定义"。
+
+### 8.2 接口规范
+
+| 文档 | 内容 |
+| --- | --- |
+| [MAAS_MONITOR_API.md](MAAS_MONITOR_API.md) | MaaS 监控告警规则（非 GLM / GLM 阈值与触发条件）以及 `POST /maas/monitor/v1/data/query` 统一数据查询接口的请求 `dimensions` / `metrics` / `filters` / `page` 与响应体规范，是本仓库 CLI 与告警服务的对接基准 |
+
+### 8.3 目录说明
+
+| 文档 | 内容 |
+| --- | --- |
+| [data/README.md](data/README.md) | `data/` 目录定位：旧版本遗留样例数据，当前主流程不再使用 |
+| [result/README.md](result/README.md) | `result/` 目录定位：明细 SQLite、聚合 SQLite、异常检测结果 CSV 等输出产物 |
+
+### 8.4 项目入口
+
+| 文档 | 内容 |
+| --- | --- |
+| [README.md](README.md) | 当前文档，包含安装、CLI 用法、告警服务、API 查询映射、文档索引 |
