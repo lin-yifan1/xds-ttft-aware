@@ -1,0 +1,14 @@
+{
+  "reported_at": "2026-05-15 10:00:00",
+  "infer_service_id": "svc-test-001",
+  "model_name": null,
+  "history_days": 14,
+  "window_before_minutes": 10,
+  "window_after_minutes": 10,
+  "config": {
+    "ttft_sla": 15000.0,
+    "tpot_sla": 50.0,
+    "severe_ratio": 7,
+    "mild_consecutive_windows": 10
+  }
+}
