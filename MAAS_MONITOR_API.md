@@ -36,9 +36,17 @@ MaaS 支持通过统一数据查询接口查询监控指标数据。
 
 | 项目 | 说明 |
 | --- | --- |
-| URL | `POST /maas/monitor/v1/data/query` |
-| 鉴权方式 | `appcode` 鉴权 |
+| URL | `POST /v1/maas/om/data/query` |
+| 鉴权方式 | 必须同时携带 `X-Apig-AppCode`、`X-Apply-DomainID`、`X-Apply-ProjectID` 三个 header |
 | 限流规则 | 同一个 `appcode` 1 分钟最多调用 10 次 |
+
+鉴权 header 详细说明：
+
+| Header | 说明 |
+| --- | --- |
+| `X-Apig-AppCode` | API 网关下发的 appcode |
+| `X-Apply-DomainID` | 调用方所属租户 ID |
+| `X-Apply-ProjectID` | 调用方所属 project ID |
 
 ## 3. 请求参数
 
@@ -156,6 +164,7 @@ curl --location --request POST 'https://modelarts-test-internal.cn-north-7.myhua
             "operator": "=",
             "value": "04f258c83e00d5a50f38c00df8021700"
         },
+        // 也可以同时过滤多个 domain_id：
         {
             "name": "domain_id",
             "operator": "IN",
