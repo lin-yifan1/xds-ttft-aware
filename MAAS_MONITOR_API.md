@@ -38,7 +38,7 @@ MaaS 支持通过统一数据查询接口查询监控指标数据。
 | --- | --- |
 | URL | `POST /maas/monitor/v1/data/query` |
 | 鉴权方式 | `appcode` 鉴权 |
-| 限流规则 | 同一个 `appcode` 1 分钟最多调用 1 次 |
+| 限流规则 | 同一个 `appcode` 1 分钟最多调用 10 次 |
 
 ## 3. 请求参数
 
@@ -94,8 +94,8 @@ MaaS 支持通过统一数据查询接口查询监控指标数据。
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `name` | 是 | 筛选字段，支持所有维度和指标 |
-| `operator` | 是 | 运算符，支持 `=`、`!=`、`>`、`<`、`>=`、`<=` |
-| `value` | 是 | 筛选值 |
+| `operator` | 是 | 运算符，支持 `=`、`!=`、`>`、`<`、`>=`、`<=`、`IN` |
+| `value` | 是 | 筛选值，`IN` 支持数组结构 |
 
 ### 3.5 page
 
@@ -106,40 +106,67 @@ MaaS 支持通过统一数据查询接口查询监控指标数据。
 
 ## 4. 请求示例
 
-```json
-{
-  "dimensions": [
-    {
-      "name": "domain_id"
-    },
-    {
-      "name": "timestamp",
-      "granularity": "minute"
+```bash
+curl --location --request POST 'https://modelarts-test-internal.cn-north-7.myhuaweicloud.com/v1/maas/om/data/query' \
+--header 'X-Apply-ProjectID: 52ed5b89fd39497eaff88e3589d32d87' \
+--header 'X-Apply-DomainID: a027d8f4e6cb4bfe88744c72a6d6d620' \
+--header 'X-Apig-AppCode: Ip2Ahr4uaJctA6fLga5L5zqtUiL2NTgtMQMBQc45rTMA4XkdU77l5GSrNp97PYxw' \
+--header 'Content-Type: application/json' \
+--data-raw '{
+    "dimensions": [
+        {
+            "name": "timestamp",
+            "granularity": "minute"
+        },
+        {
+            "name": "domain_id"
+        },
+        {
+            "name": "infer_service_id"
+        }
+        
+    ],
+    "metrics": [
+        {
+            "name": "ttft_avg",
+            "func": "avg"
+        },
+        {
+             "name": "success_cnt",
+            "func": "avg"
+        },
+        {
+             "name": "error_cnt",
+            "func": "avg"
+        }
+    ],
+    "filters": [
+        {
+            "name": "timestamp",
+            "operator": ">=",
+            "value": "1779321600000"
+        },
+        {
+            "name": "timestamp",
+            "operator": "<=",
+            "value": "1779349646000"
+        },
+        {
+            "name": "domain_id",
+            "operator": "=",
+            "value": "04f258c83e00d5a50f38c00df8021700"
+        },
+        {
+            "name": "domain_id",
+            "operator": "IN",
+            "value": ["a", "b", "c"]
+        }
+    ],
+    "page": {
+        "pageNum": 1,
+        "pageSize": 1000
     }
-  ],
-  "metrics": [
-    {
-      "name": "ttft",
-      "func": "avg"
-    }
-  ],
-  "filters": [
-    {
-      "name": "timestamp",
-      "operator": ">=",
-      "value": "1778686614"
-    },
-    {
-      "name": "timestamp",
-      "operator": "<=",
-      "value": "1778686614"
-    }
-  ],
-  "page": {
-    "pageNum": 1,
-    "pageSize": 1000
-  }
-}
+}'
 ```
 
 ## 5. 返回体
@@ -160,25 +187,30 @@ MaaS 支持通过统一数据查询接口查询监控指标数据。
 
 ```json
 {
-  "code": 200,
+  "total": 38,
   "msg": "success",
-  "data": {
-    "total": 120,
-    "list": [
-      {
-        "domain_id": "C001",
-        "timestamp": "1778686614",
-        "ttft": 85.62
-      },
-      {
-        "domain_id": "C001",
-        "timestamp": "1778686614",
-        "ttft": 88.15
-      }
-    ],
-    "pageNum": 1,
-    "pageSize": 1000,
-    "pages": 1
-  }
+  "list": [
+    {
+      "domain_id": "C001",
+      "error_cnt": 1,
+      "infer_service_id": "",
+      "success_cnt": 0,
+      "timestamp": 1779345420000,
+      "ttft_avg": 85.62
+    },
+    {
+      "domain_id": "C001",
+      "error_cnt": 1,
+      "infer_service_id": "S001",
+      "success_cnt": 0,
+      "timestamp": 1779345420000,
+      "ttft_avg": 85.62
+    },
+  ],
+  "pageNum": 1,
+  "pageSize": 1000,
+  "pages": 1
 }
 ```
+
+> 注意！如上所示，返回的数据可能不包含 `infer_service_id` 信息，这种数据需要过滤掉。

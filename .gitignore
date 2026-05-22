@@ -13,3 +13,4 @@ data2/*
 !data2/README.md
 result/**/*.xlsx
 result/**/*.sqlite
+.claude/settings.local.json
