@@ -82,7 +82,7 @@ MaaS 支持通过统一数据查询接口查询监控指标数据。
 | `name` | 是 | 指标名称 |
 | `func` | 是 | 聚合函数，支持 `avg`、`sum` |
 
-查询 `TTFT` 和 `TPOT` 时，传原始指标名 `ttft`、`tpot`，再通过 `func = avg` 指定平均聚合。
+查询 `TTFT` 和 `TPOT` 时，传指标名 `ttft_avg`、`tpot_avg`，并通过 `func = avg` 指定平均聚合。
 
 支持的指标：
 
@@ -90,8 +90,8 @@ MaaS 支持通过统一数据查询接口查询监控指标数据。
 | --- | --- |
 | `rpm` | 每分钟请求数 |
 | `tpm` | 每分钟 token 数 |
-| `ttft` | 首字时延 |
-| `tpot` | 逐 token 时延 |
+| `ttft_avg` | 首字时延（分钟内平均） |
+| `tpot_avg` | 逐 token 时延（分钟内平均） |
 | `prompt_tokens` | 一分钟内平均输入长度 |
 | `completion_tokens` | 一分钟内平均输出长度 |
 | `success_cnt` | 成功次数 |

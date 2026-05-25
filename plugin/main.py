@@ -161,17 +161,19 @@ class MaasApiError(RuntimeError):
 
 
 QUERY_DIMENSIONS = [
-    {"name": "domain_id"},
     {"name": "timestamp", "granularity": "minute"},
+    {"name": "domain_id"},
 ]
 
 QUERY_METRICS = [
-    {"name": "rpm", "func": "sum"},
-    {"name": "tpm", "func": "sum"},
-    {"name": "ttft", "func": "avg"},
-    {"name": "tpot", "func": "avg"},
+    {"name": "ttft_avg", "func": "avg"},
+    {"name": "tpot_avg", "func": "avg"},
+    {"name": "success_cnt", "func": "sum"},
+    {"name": "error_cnt", "func": "sum"},
     {"name": "prompt_tokens", "func": "avg"},
     {"name": "completion_tokens", "func": "avg"},
+    {"name": "rpm", "func": "sum"},
+    {"name": "tpm", "func": "sum"},
 ]
 
 
@@ -295,16 +297,22 @@ def rows_to_dataframe(rows: list[dict], tz_name: str) -> pd.DataFrame:
         domain_id = str(row.get("domain_id", "")).strip()
         if not domain_id:
             continue
+        if "infer_service_id" in row and not str(row.get("infer_service_id") or "").strip():
+            continue
         ts = _row_timestamp_to_local(row.get("timestamp"), tz)
         if ts is None:
+            continue
+        success_cnt = _to_float(row.get("success_cnt"))
+        error_cnt = _to_float(row.get("error_cnt"))
+        if success_cnt + error_cnt <= 0:
             continue
         records.append(
             {
                 "domain_id": domain_id,
                 "rpm": _to_float(row.get("rpm")),
                 "tpm": _to_float(row.get("tpm")),
-                "ttft_avg": _to_float(row.get("ttft")),
-                "tpot_avg": _to_float(row.get("tpot")),
+                "ttft_avg": _to_float(row.get("ttft_avg")),
+                "tpot_avg": _to_float(row.get("tpot_avg")),
                 "prompt_tokens": _to_float(row.get("prompt_tokens")),
                 "completion_tokens": _to_float(row.get("completion_tokens")),
                 "collect_time_std_parsed": pd.Timestamp(ts),
@@ -910,10 +918,11 @@ def run_plugin(
         r1_start.isoformat(timespec="minutes"),
         r1_end.isoformat(timespec="minutes"),
     )
+    r1_end_inclusive = r1_end - timedelta(minutes=1)
     r1_filters = [
         {"name": "infer_service_id", "operator": "=", "value": service_id},
         {"name": "timestamp", "operator": ">=", "value": str(to_epoch_ms(r1_start))},
-        {"name": "timestamp", "operator": "<", "value": str(to_epoch_ms(r1_end))},
+        {"name": "timestamp", "operator": "<=", "value": str(to_epoch_ms(r1_end_inclusive))},
     ]
     r1_rows = client.query(r1_filters)
     r1_df = rows_to_dataframe(r1_rows, cfg.timezone)
@@ -981,10 +990,11 @@ def run_plugin(
         r2_start.isoformat(timespec="minutes"),
         r2_end.isoformat(timespec="minutes"),
     )
+    r2_end_inclusive = r2_end - timedelta(minutes=1)
     r2_filters = [
-        {"name": "domain_id", "operator": "IN", "value": candidates},
+        {"name": "domain_id", "operator": "in", "value": candidates},
         {"name": "timestamp", "operator": ">=", "value": str(to_epoch_ms(r2_start))},
-        {"name": "timestamp", "operator": "<", "value": str(to_epoch_ms(r2_end))},
+        {"name": "timestamp", "operator": "<=", "value": str(to_epoch_ms(r2_end_inclusive))},
     ]
     r2_rows = client.query(r2_filters)
     r2_df = rows_to_dataframe(r2_rows, cfg.timezone)

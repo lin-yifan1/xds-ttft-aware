@@ -139,3 +139,4 @@ python main.py    # 输出 { "status": "error", "error_type": "InvalidArgs", ...
 - Round 2 用 `domain_id IN [...]`，候选数过大时建议增大 `PLUGIN_TIMEOUT_SECONDS` 或减少 `PLUGIN_CANDIDATE_TOP_N`
 - 候选少于 `min_baseline_points=6` 个同时刻历史样本时，该候选 baseline 默认为 0，可能造成评分偏高
 - 严格按 7 个位置参；如需扩展（如 `model_name` 过滤），需要修改 `main.py` 中 `EXPECTED_ARG_COUNT` 与 `run_plugin` 签名
+- 无池子过滤：返回行中 `infer_service_id` 字段为空、或 `success_cnt + error_cnt == 0` 的分钟级数据视为无主聚合/无流量，在 `rows_to_dataframe` 入口处丢弃，不参与算法
