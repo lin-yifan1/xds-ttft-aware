@@ -925,7 +925,9 @@ def run_plugin(
         {"name": "timestamp", "operator": "<=", "value": str(to_epoch_ms(r1_end_inclusive))},
     ]
     r1_rows = client.query(r1_filters)
+    log.info("[round1] rows=%d first_row=%s", len(r1_rows), r1_rows[0] if r1_rows else None)
     r1_df = rows_to_dataframe(r1_rows, cfg.timezone)
+    log.info("[round1] df_rows=%d after filter", len(r1_df))
 
     if r1_df.empty:
         out = _make_base_output("no_data", cfg, domain_id, service_id, reported_at)
