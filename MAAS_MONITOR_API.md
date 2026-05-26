@@ -186,11 +186,13 @@ curl --location --request POST 'https://modelarts-test-internal.cn-north-7.myhua
 | --- | --- | --- |
 | `code` | int | `200` 成功；`400` 参数错误；`401` 鉴权失败；`403` 权限不足；`429` 限流；`500` 服务异常 |
 | `msg` | string | 返回提示信息 |
-| `data.total` | long | 符合条件总条数 |
-| `data.list` | 数组对象 | 结果数据集 |
-| `data.pageNum` | int | 当前页码 |
-| `data.pageSize` | int | 当前页条数 |
-| `data.pages` | int | 总页数 |
+| `total` | long | 符合条件总条数 |
+| `list` | 数组对象 | 结果数据集 |
+| `pageNum` | int | 当前页码 |
+| `pageSize` | int | 当前页条数 |
+| `pages` | int | 总页数 |
+
+> 注：分页字段位于响应顶层，不在嵌套的 `data` 对象下，与 5.2 示例一致。
 
 ### 5.2 返回示例
 

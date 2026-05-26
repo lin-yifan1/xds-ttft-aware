@@ -22,7 +22,7 @@ python main.py <domain_id> <service_id> <time> <maasApiurl> \
 | ---: | --- | --- | --- |
 | 1 | `domain_id` | 告警上报租户 ID | 用于跨池历史查询和输出标注 `is_alert_reporter` |
 | 2 | `service_id` | `infer_service_id` | Round 1 查询过滤维度 |
-| 3 | `time` | ISO 8601 时间 | 例 `2026-05-22T10:30:00+08:00`；无 tz 后缀时按 `PLUGIN_TIMEZONE` 解释 |
+| 3 | `time` | ISO 8601 字符串或数字时间戳 | 例 `2026-05-22T10:30:00+08:00` 或 `1779349646000`；数字 > `1e12` 视为毫秒；ISO 无 tz 后缀时按 `PLUGIN_TIMEZONE` 解释 |
 | 4 | `maasApiurl` | MaaS 数据查询接口完整端点 URL | 例 `https://.../v1/maas/om/data/query` |
 | 5 | `appcode` | API 网关 appcode | 作为 `X-Apig-AppCode` header |
 | 6 | `applydomainid` | 调用方租户 ID | 作为 `X-Apply-DomainID` header |

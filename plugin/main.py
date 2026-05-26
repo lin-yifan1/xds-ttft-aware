@@ -5,7 +5,7 @@
 入参（位置参数，顺序固定）：
     1. domain_id          告警上报租户 ID
     2. service_id         infer_service_id
-    3. time               ISO 8601 字符串，支持时区后缀，例如 2026-05-22T10:30:00+08:00
+    3. time               ISO 8601 字符串或数字时间戳（秒/毫秒自动判定），例如 2026-05-22T10:30:00+08:00 或 1779349646000
     4. maasApiurl         MaaS 数据查询接口完整端点 URL
     5. appcode            -> X-Apig-AppCode header
     6. applydomainid      -> X-Apply-DomainID header
@@ -136,11 +136,21 @@ def parse_iso_reported_at(value: str, default_tz: str) -> datetime:
     text = str(value).strip()
     if not text:
         raise ValueError("time argument is empty")
+    # 优先尝试时间戳格式（纯数字，支持秒/毫秒）
+    try:
+        ts = float(text)
+        if ts > 1e12:  # 毫秒级时间戳
+            ts = ts / 1000.0
+        parsed = datetime.fromtimestamp(ts, tz=ZoneInfo(default_tz))
+        return parsed.replace(second=0, microsecond=0)
+    except (ValueError, OverflowError, OSError):
+        pass
+    # 回退到 ISO 8601 字符串
     normalized = text.replace("Z", "+00:00")
     try:
         parsed = datetime.fromisoformat(normalized)
     except Exception as exc:
-        raise ValueError(f"time argument is not valid ISO 8601: {value!r}") from exc
+        raise ValueError(f"time argument is not valid ISO 8601 or timestamp: {value!r}") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=ZoneInfo(default_tz))
     return parsed.replace(second=0, microsecond=0)
@@ -217,13 +227,12 @@ class MaasClient:
                 "page": {"pageNum": int(page_num), "pageSize": self.page_size},
             }
             data = self._post(payload)
-            page_data = data.get("data") or {}
-            page_rows = page_data.get("list") or []
+            page_rows = data.get("list") or []
             if not isinstance(page_rows, list):
-                raise MaasApiError("MaaS API data.list is not a list")
+                raise MaasApiError("MaaS API list is not a list")
             rows.extend(page_rows)
-            pages = int(page_data.get("pages") or 1)
-            current_page = int(page_data.get("pageNum") or page_num)
+            pages = int(data.get("pages") or 1)
+            current_page = int(data.get("pageNum") or page_num)
             if current_page >= pages or not page_rows:
                 break
             page_num = current_page + 1
