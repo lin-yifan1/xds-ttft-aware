@@ -19,6 +19,10 @@
     PLUGIN_HISTORY_DAYS              默认 14
     PLUGIN_CANDIDATE_TOP_N           默认 6
     PLUGIN_CULPRIT_TOP_K             默认 3
+    PLUGIN_SCENARIO_TRIGGER_FACTOR   默认 1.3  (current >= baseline × factor 才点亮场景)
+    PLUGIN_TPM_CAP_FACTOR            默认 1.5  (input_too_long: tpm_limit = baseline_tpm × factor)
+    PLUGIN_OUTPUT_CAP_FACTOR         默认 1.5  (output_too_long: max_output = baseline_completion × factor)
+    PLUGIN_RPM_SHRINK_FACTOR         默认 0.8  (rpm_increase: rpm_limit = baseline_rpm × factor)
     PLUGIN_TIMEZONE                  默认 Asia/Shanghai
 
 输出契约：
@@ -55,14 +59,20 @@ log = logging.getLogger("maas_plugin")
 # ============================================================================
 
 EPSILON = 1e-9
-DOMINANCE_RATIO = 1.2
-LENGTH_SIGNAL_MIN_RATIO = 0.15
-LENGTH_SIGNAL_JOINT_MIN_RATIO = 0.30
 
+# 三维评分权重 (w_rpm, w_input, w_output)。被 scope 门控的维度权重为 0；
+# 由原四维权重去掉 TPM 与被门控维度后按比例归一化得到。
 SCORE_WEIGHTS_BY_SCOPE = {
-    "ttft_only": (0.35, 0.15, 0.40, 0.10),
-    "tpot_only": (0.10, 0.25, 0.15, 0.50),
-    "both": (0.225, 0.20, 0.275, 0.30),
+    "ttft_only": (0.4667, 0.5333, 0.0),
+    "tpot_only": (0.0, 0.0, 1.0),
+    "both": (0.28125, 0.34375, 0.375),
+}
+
+# 每个 scope 下物理上允许点亮的场景（严格门控）。
+ELIGIBLE_SCENARIOS_BY_SCOPE = {
+    "ttft_only": ("rpm_increase", "input_too_long"),
+    "tpot_only": ("output_too_long",),
+    "both": ("rpm_increase", "input_too_long", "output_too_long"),
 }
 
 
@@ -80,6 +90,10 @@ class PluginConfig:
     culprit_min_ratio: float = 0.05
     history_days: int = 14
     candidate_top_n: int = 6
+    scenario_trigger_factor: float = 1.3
+    tpm_cap_factor: float = 1.5
+    output_cap_factor: float = 1.5
+    rpm_shrink_factor: float = 0.8
     window_before_minutes: int = 30
     window_after_minutes: int = 30
     history_same_time_minutes: int = 10
@@ -124,6 +138,10 @@ def load_config_from_env() -> PluginConfig:
         history_days=_env_int("PLUGIN_HISTORY_DAYS", 14),
         candidate_top_n=_env_int("PLUGIN_CANDIDATE_TOP_N", 6),
         culprit_top_k=_env_int("PLUGIN_CULPRIT_TOP_K", 3),
+        scenario_trigger_factor=_env_float("PLUGIN_SCENARIO_TRIGGER_FACTOR", 1.3),
+        tpm_cap_factor=_env_float("PLUGIN_TPM_CAP_FACTOR", 1.5),
+        output_cap_factor=_env_float("PLUGIN_OUTPUT_CAP_FACTOR", 1.5),
+        rpm_shrink_factor=_env_float("PLUGIN_RPM_SHRINK_FACTOR", 0.8),
         timezone=_env_str("PLUGIN_TIMEZONE", "Asia/Shanghai"),
     )
 
@@ -607,96 +625,115 @@ def _safe_ratio(values: np.ndarray) -> np.ndarray:
 
 def _combined_local_score(
     rpm_excess: np.ndarray,
-    tpm_excess: np.ndarray,
     prompt_delta_excess: np.ndarray,
     completion_delta_excess: np.ndarray,
-    weights: tuple[float, float, float, float],
+    weights: tuple[float, float, float],
 ) -> np.ndarray:
-    w_rpm, w_tpm, w_prompt, w_completion = weights
+    w_rpm, w_input, w_output = weights
     score = np.zeros_like(rpm_excess, dtype=float)
     totals = [
         float(np.sum(rpm_excess)),
-        float(np.sum(tpm_excess)),
         float(np.sum(prompt_delta_excess)),
         float(np.sum(completion_delta_excess)),
     ]
     if totals[0] > 0:
         score += w_rpm * (rpm_excess / totals[0])
     if totals[1] > 0:
-        score += w_tpm * (tpm_excess / totals[1])
+        score += w_input * (prompt_delta_excess / totals[1])
     if totals[2] > 0:
-        score += w_prompt * (prompt_delta_excess / totals[2])
-    if totals[3] > 0:
-        score += w_completion * (completion_delta_excess / totals[3])
+        score += w_output * (completion_delta_excess / totals[2])
     return score
 
 
-def _length_signal(
-    prompt_ratio: float, completion_ratio: float, rpm_ratio: float, tpm_ratio: float
-) -> str:
-    prompt_ratio = float(prompt_ratio)
-    completion_ratio = float(completion_ratio)
-    traffic_ratio = float(max(rpm_ratio, tpm_ratio))
-    if prompt_ratio <= 0 and completion_ratio <= 0:
-        return "traffic_dominant"
-    if (
-        prompt_ratio >= LENGTH_SIGNAL_MIN_RATIO
-        and completion_ratio >= LENGTH_SIGNAL_MIN_RATIO
-        and (prompt_ratio + completion_ratio)
-        >= max(traffic_ratio, LENGTH_SIGNAL_JOINT_MIN_RATIO)
-    ):
-        return "io_shift_joint"
-    if prompt_ratio >= max(completion_ratio * DOMINANCE_RATIO, traffic_ratio):
-        return "input_shift_dominant"
-    if completion_ratio >= max(prompt_ratio * DOMINANCE_RATIO, traffic_ratio):
-        return "output_shift_dominant"
-    if max(prompt_ratio, completion_ratio) >= traffic_ratio:
-        return "length_shift_mixed"
-    return "traffic_dominant"
+# 三场景定义：trigger 指标（决定是否点亮）+ remediation 杠杆（限流建议落在哪个指标）。
+# 注意 input_too_long 的触发看 prompt_tokens，但限流杠杆是 tpm。
+_SCENARIO_SPECS: dict[str, dict[str, str]] = {
+    "rpm_increase": {
+        "trigger_metric": "rpm",
+        "action": "throttle_rpm",
+        "target_metric": "rpm",
+        "factor_attr": "rpm_shrink_factor",
+    },
+    "input_too_long": {
+        "trigger_metric": "prompt_tokens",
+        "action": "cap_tpm",
+        "target_metric": "tpm",
+        "factor_attr": "tpm_cap_factor",
+    },
+    "output_too_long": {
+        "trigger_metric": "completion_tokens",
+        "action": "cap_output_length",
+        "target_metric": "completion_tokens",
+        "factor_attr": "output_cap_factor",
+    },
+}
 
 
-def _dominance_label(
-    primary: float, secondary: float, primary_label: str, secondary_label: str, mixed: str
-) -> str:
-    primary = float(primary)
-    secondary = float(secondary)
-    if primary <= 0 and secondary <= 0:
-        return "unclear"
-    if primary >= secondary * DOMINANCE_RATIO:
-        return primary_label
-    if secondary >= primary * DOMINANCE_RATIO:
-        return secondary_label
-    return mixed
+def _window_mean(values: np.ndarray) -> float:
+    """窗口内非 0 有限值的均值；无有效点时返回 0.0。"""
+    arr = np.asarray(values, dtype=float)
+    valid = arr[np.isfinite(arr) & (arr > 0)]
+    if valid.size == 0:
+        return 0.0
+    return float(np.mean(valid))
 
 
-def _culprit_driver_signal(
+def _baseline_scalar(values: np.ndarray) -> float | None:
+    """窗口内非 0 历史偏移基线的均值；全 0/空 视为不可用，返回 None。"""
+    arr = np.asarray(values, dtype=float)
+    valid = arr[np.isfinite(arr) & (arr > 0)]
+    if valid.size == 0:
+        return None
+    return float(np.mean(valid))
+
+
+def _build_scenarios_for_culprit(
+    cfg: PluginConfig,
     scope: str,
-    rpm_ratio: float,
-    tpm_ratio: float,
-    prompt_ratio: float,
-    completion_ratio: float,
-) -> str:
-    if scope == "ttft_only":
-        return _dominance_label(
-            rpm_ratio, prompt_ratio, "rpm_rise_dominant", "input_shift_dominant", "rpm_input_mixed"
+    current: dict[str, float],
+    baseline: dict[str, float | None],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """按 scope 门控枚举可点亮场景，返回 (fired_scenarios, suppressed_types)。
+
+    点亮条件：trigger 指标当前值 >= 自身 baseline × scenario_trigger_factor。
+    任一所需 baseline（trigger 或 remediation 目标）不可用 -> 抑制并计入告警。
+    remediation 值 = 目标指标 baseline × 对应系数。
+    """
+    fired: list[dict[str, Any]] = []
+    suppressed: list[str] = []
+    for scenario_type in ELIGIBLE_SCENARIOS_BY_SCOPE.get(scope, ()):
+        spec = _SCENARIO_SPECS[scenario_type]
+        trigger_metric = spec["trigger_metric"]
+        target_metric = spec["target_metric"]
+        trigger_baseline = baseline.get(trigger_metric)
+        target_baseline = baseline.get(target_metric)
+        if trigger_baseline is None or target_baseline is None:
+            suppressed.append(scenario_type)
+            continue
+        cur = float(current.get(trigger_metric, 0.0))
+        if cur < trigger_baseline * cfg.scenario_trigger_factor:
+            continue
+        factor = float(getattr(cfg, spec["factor_attr"]))
+        fired.append(
+            {
+                "type": scenario_type,
+                "trigger": {
+                    "metric": trigger_metric,
+                    "current": cur,
+                    "baseline": float(trigger_baseline),
+                    "ratio": cur / trigger_baseline,
+                },
+                "remediation": {
+                    "action": spec["action"],
+                    "target_metric": target_metric,
+                    "baseline": float(target_baseline),
+                    "factor": factor,
+                    "recommended_value": float(target_baseline) * factor,
+                },
+            }
         )
-    if scope == "tpot_only":
-        return _dominance_label(
-            tpm_ratio,
-            completion_ratio,
-            "tpm_rise_dominant",
-            "output_shift_dominant",
-            "tpm_output_mixed",
-        )
-    traffic_ratio = 0.5 * rpm_ratio + 0.5 * tpm_ratio
-    length_ratio = 0.5 * prompt_ratio + 0.5 * completion_ratio
-    return _dominance_label(
-        traffic_ratio,
-        length_ratio,
-        "traffic_family_dominant",
-        "length_family_dominant",
-        "traffic_length_mixed",
-    )
+    fired.sort(key=lambda s: s["trigger"]["ratio"], reverse=True)
+    return fired, suppressed
 
 
 # ============================================================================
@@ -1025,12 +1062,9 @@ def run_plugin(
         cfg, history_prepared, cand_user_ids, time_index, pd.Timestamp(reported_naive)
     )
 
-    # ---- 评分 ----
+    # ---- 评分（三维：rpm / input / output；TPM 退出评分，仅保留 baseline 作杠杆）----
     rpm_excess_window = np.clip(
         cand_matrices["rpm"][:, a : b + 1] - baselines["rpm"][:, a : b + 1], 0.0, None
-    )
-    tpm_excess_window = np.clip(
-        cand_matrices["tpm"][:, a : b + 1] - baselines["tpm"][:, a : b + 1], 0.0, None
     )
     prompt_delta_window = np.clip(
         cand_matrices["prompt_tokens"][:, a : b + 1]
@@ -1046,23 +1080,16 @@ def run_plugin(
     )
 
     rpm_excess_sum = rpm_excess_window.sum(axis=1)
-    tpm_excess_sum = tpm_excess_window.sum(axis=1)
     prompt_delta_sum = prompt_delta_window.sum(axis=1)
     completion_delta_sum = completion_delta_window.sum(axis=1)
 
     rpm_ratio = _safe_ratio(rpm_excess_sum)
-    tpm_ratio = _safe_ratio(tpm_excess_sum)
     prompt_ratio = _safe_ratio(prompt_delta_sum)
     completion_ratio = _safe_ratio(completion_delta_sum)
 
     weights = SCORE_WEIGHTS_BY_SCOPE.get(scope, SCORE_WEIGHTS_BY_SCOPE["both"])
-    w_rpm, w_tpm, w_prompt, w_completion = weights
-    scores = (
-        w_rpm * rpm_ratio
-        + w_tpm * tpm_ratio
-        + w_prompt * prompt_ratio
-        + w_completion * completion_ratio
-    )
+    w_rpm, w_input, w_output = weights
+    scores = w_rpm * rpm_ratio + w_input * prompt_ratio + w_output * completion_ratio
     score_sum = float(np.sum(scores))
     score_ratio = scores / score_sum if score_sum > 0 else np.zeros_like(scores)
 
@@ -1078,43 +1105,54 @@ def run_plugin(
             break
         local_score = _combined_local_score(
             rpm_excess_window[idx],
-            tpm_excess_window[idx],
             prompt_delta_window[idx],
             completion_delta_window[idx],
             weights,
         )
         peak_offset = int(np.argmax(local_score)) if local_score.size else 0
         peak_idx = int(a + peak_offset)
-        length_signal = _length_signal(
-            prompt_ratio[idx], completion_ratio[idx], rpm_ratio[idx], tpm_ratio[idx]
+
+        current_scalars = {
+            "rpm": _window_mean(cand_matrices["rpm"][idx, a : b + 1]),
+            "prompt_tokens": _window_mean(cand_matrices["prompt_tokens"][idx, a : b + 1]),
+            "completion_tokens": _window_mean(
+                cand_matrices["completion_tokens"][idx, a : b + 1]
+            ),
+        }
+        baseline_scalars: dict[str, float | None] = {
+            "rpm": _baseline_scalar(baselines["rpm"][idx, a : b + 1]),
+            "tpm": _baseline_scalar(baselines["tpm"][idx, a : b + 1]),
+            "prompt_tokens": _baseline_scalar(baselines["prompt_tokens"][idx, a : b + 1]),
+            "completion_tokens": _baseline_scalar(
+                baselines["completion_tokens"][idx, a : b + 1]
+            ),
+        }
+        scenarios, suppressed = _build_scenarios_for_culprit(
+            cfg, scope, current_scalars, baseline_scalars
         )
-        driver_signal = _culprit_driver_signal(
-            scope, rpm_ratio[idx], tpm_ratio[idx], prompt_ratio[idx], completion_ratio[idx]
-        )
+
         uid = cand_user_ids[idx]
-        culprits.append(
-            {
-                "domain_id": uid,
-                "is_alert_reporter": bool(uid == domain_id),
-                "score": float(scores[idx]),
-                "score_ratio": ratio,
-                "driver_signal": driver_signal,
-                "length_signal": length_signal,
-                "rpm_excess_ratio": float(rpm_ratio[idx]),
-                "tpm_excess_ratio": float(tpm_ratio[idx]),
-                "prompt_delta_ratio": float(prompt_ratio[idx]),
-                "completion_delta_ratio": float(completion_ratio[idx]),
-                "peak_time": _format_ts(time_index, peak_idx, tz),
-                "peak_rpm": float(cand_matrices["rpm"][idx, peak_idx]),
-                "peak_tpm": float(cand_matrices["tpm"][idx, peak_idx]),
-                "peak_ttft": float(cand_matrices["ttft"][idx, peak_idx]),
-                "peak_tpot": float(cand_matrices["tpot"][idx, peak_idx]),
-                "peak_prompt_tokens": float(cand_matrices["prompt_tokens"][idx, peak_idx]),
-                "peak_completion_tokens": float(
-                    cand_matrices["completion_tokens"][idx, peak_idx]
-                ),
-            }
-        )
+        culprit: dict[str, Any] = {
+            "domain_id": uid,
+            "is_alert_reporter": bool(uid == domain_id),
+            "score": float(scores[idx]),
+            "score_ratio": ratio,
+            "scenarios": scenarios,
+            "peak_time": _format_ts(time_index, peak_idx, tz),
+            "peak_rpm": float(cand_matrices["rpm"][idx, peak_idx]),
+            "peak_tpm": float(cand_matrices["tpm"][idx, peak_idx]),
+            "peak_ttft": float(cand_matrices["ttft"][idx, peak_idx]),
+            "peak_tpot": float(cand_matrices["tpot"][idx, peak_idx]),
+            "peak_prompt_tokens": float(cand_matrices["prompt_tokens"][idx, peak_idx]),
+            "peak_completion_tokens": float(
+                cand_matrices["completion_tokens"][idx, peak_idx]
+            ),
+        }
+        if suppressed:
+            culprit["warning"] = "baseline_unavailable: " + ", ".join(suppressed)
+        if not scenarios:
+            culprit["note"] = "no_scenario_triggered"
+        culprits.append(culprit)
         cumulative += ratio
         if len(culprits) >= cfg.culprit_top_k or cumulative >= cfg.culprit_cum_ratio:
             break

@@ -51,6 +51,10 @@ python main.py "d-001" "s-abc" "2026-05-22T10:30:00+08:00" \
     "culprit_min_ratio": 0.05,
     "history_days": 14,
     "candidate_top_n": 6,
+    "scenario_trigger_factor": 1.3,
+    "tpm_cap_factor": 1.5,
+    "output_cap_factor": 1.5,
+    "rpm_shrink_factor": 0.8,
     "window_before_minutes": 30,
     "window_after_minutes": 30,
     "history_same_time_minutes": 10,
@@ -115,12 +119,13 @@ python main.py "d-001" "s-abc" "2026-05-22T10:30:00+08:00" \
       "is_alert_reporter": false,
       "score": 0.4218,
       "score_ratio": 0.5512,
-      "driver_signal": "traffic_family_dominant",
-      "length_signal": "traffic_dominant",
-      "rpm_excess_ratio": 0.6248,
-      "tpm_excess_ratio": 0.5871,
-      "prompt_delta_ratio": 0.1142,
-      "completion_delta_ratio": 0.0987,
+      "scenarios": [
+        {
+          "type": "rpm_increase",
+          "trigger": {"metric": "rpm", "current": 388.5, "baseline": 178.2, "ratio": 2.1801},
+          "remediation": {"action": "throttle_rpm", "target_metric": "rpm", "baseline": 178.2, "factor": 0.8, "recommended_value": 142.56}
+        }
+      ],
       "peak_time": "2026-05-22T10:30+08:00",
       "peak_rpm": 412.0,
       "peak_tpm": 463240.0,
@@ -134,12 +139,18 @@ python main.py "d-001" "s-abc" "2026-05-22T10:30:00+08:00" \
       "is_alert_reporter": true,
       "score": 0.1842,
       "score_ratio": 0.2407,
-      "driver_signal": "length_family_dominant",
-      "length_signal": "io_shift_joint",
-      "rpm_excess_ratio": 0.0824,
-      "tpm_excess_ratio": 0.0961,
-      "prompt_delta_ratio": 0.4128,
-      "completion_delta_ratio": 0.4862,
+      "scenarios": [
+        {
+          "type": "output_too_long",
+          "trigger": {"metric": "completion_tokens", "current": 497.3, "baseline": 245.0, "ratio": 2.0298},
+          "remediation": {"action": "cap_output_length", "target_metric": "completion_tokens", "baseline": 245.0, "factor": 1.5, "recommended_value": 367.5}
+        },
+        {
+          "type": "input_too_long",
+          "trigger": {"metric": "prompt_tokens", "current": 1208.4, "baseline": 792.0, "ratio": 1.5258},
+          "remediation": {"action": "cap_tpm", "target_metric": "tpm", "baseline": 205320.0, "factor": 1.5, "recommended_value": 307980.0}
+        }
+      ],
       "peak_time": "2026-05-22T10:31+08:00",
       "peak_rpm": 142.0,
       "peak_tpm": 218430.0,
@@ -153,12 +164,18 @@ python main.py "d-001" "s-abc" "2026-05-22T10:30:00+08:00" \
       "is_alert_reporter": false,
       "score": 0.1246,
       "score_ratio": 0.1628,
-      "driver_signal": "traffic_length_mixed",
-      "length_signal": "length_shift_mixed",
-      "rpm_excess_ratio": 0.1843,
-      "tpm_excess_ratio": 0.2014,
-      "prompt_delta_ratio": 0.2245,
-      "completion_delta_ratio": 0.1632,
+      "scenarios": [
+        {
+          "type": "rpm_increase",
+          "trigger": {"metric": "rpm", "current": 205.2, "baseline": 142.5, "ratio": 1.4400},
+          "remediation": {"action": "throttle_rpm", "target_metric": "rpm", "baseline": 142.5, "factor": 0.8, "recommended_value": 114.0}
+        },
+        {
+          "type": "input_too_long",
+          "trigger": {"metric": "prompt_tokens", "current": 982.4, "baseline": 735.0, "ratio": 1.3366},
+          "remediation": {"action": "cap_tpm", "target_metric": "tpm", "baseline": 178400.0, "factor": 1.5, "recommended_value": 267600.0}
+        }
+      ],
       "peak_time": "2026-05-22T10:29+08:00",
       "peak_rpm": 218.0,
       "peak_tpm": 240620.0,
@@ -181,7 +198,9 @@ python main.py "d-001" "s-abc" "2026-05-22T10:30:00+08:00" \
 ### 读法速记
 
 - `system_stats.system_anom_hours_count = 10` 与 `events[0].duration_minutes = 10` 对齐，说明事件窗口刚好覆盖所有异常分钟。
-- `events[0].scope = "both"` 决定 `SCORE_WEIGHTS_BY_SCOPE["both"] = (0.225, 0.20, 0.275, 0.30)`，长度类权重整体高于流量类，因此 `d-001`（length 主导）排到 #2。
+- `events[0].scope = "both"` 决定 `SCORE_WEIGHTS_BY_SCOPE["both"] = (0.28125, 0.34375, 0.375)`（顺序 `w_rpm / w_input / w_output`），三类场景均可点亮；`d-003` 因 RPM 超基线占比最高排 #1，`d-001` 由输入/输出长度漂移驱动排 #2。
+- 每个 culprit 的 `scenarios` 按 `trigger.ratio` 降序排列：`d-001` 先 `output_too_long`（2.03×）再 `input_too_long`（1.53×）；`d-005` 先 `rpm_increase`（1.44×）再 `input_too_long`（1.34×）。未达 `scenario_trigger_factor (1.3)` 的维度不点亮 —— `d-003` 的输入长度接近基线，故只有 `rpm_increase`。
+- `remediation.recommended_value` 即给下游的限流阈值：`d-001` 的 `output_too_long` 建议把单请求输出截到 `367.5 = 245.0 × 1.5`，`input_too_long` 建议把 TPM 限到 `307980 = 205320 × 1.5`（触发看输入长度，限流杠杆落在 TPM）。
 - `culprits[0].score_ratio + culprits[1].score_ratio = 0.79`，仍 `< culprit_cum_ratio (0.8)`，所以继续遍历到第 3 个；累计 0.95 后或达到 `culprit_top_k = 3` 时停止。
 - `api_call_count = 2`：Round 1 + Round 2 各一次，未触发分页。
 
@@ -215,6 +234,10 @@ python main.py "d-001" "s-abc" "2026-05-22T10:30:00+08:00" \
     "culprit_min_ratio": 0.05,
     "history_days": 14,
     "candidate_top_n": 6,
+    "scenario_trigger_factor": 1.3,
+    "tpm_cap_factor": 1.5,
+    "output_cap_factor": 1.5,
+    "rpm_shrink_factor": 0.8,
     "window_before_minutes": 30,
     "window_after_minutes": 30,
     "history_same_time_minutes": 10,
@@ -285,6 +308,10 @@ python main.py "d-001" "s-abc" "2026-05-22T10:30:00+08:00" \
     "culprit_min_ratio": 0.05,
     "history_days": 14,
     "candidate_top_n": 6,
+    "scenario_trigger_factor": 1.3,
+    "tpm_cap_factor": 1.5,
+    "output_cap_factor": 1.5,
+    "rpm_shrink_factor": 0.8,
     "window_before_minutes": 30,
     "window_after_minutes": 30,
     "history_same_time_minutes": 10,

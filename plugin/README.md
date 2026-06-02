@@ -39,6 +39,10 @@ python main.py <domain_id> <service_id> <time> <maasApiurl> \
 | `PLUGIN_HISTORY_DAYS` | `14` | Round 2 跨池历史回看天数 |
 | `PLUGIN_CANDIDATE_TOP_N` | `6` | Round 1 事件窗口内取多少候选租户 |
 | `PLUGIN_CULPRIT_TOP_K` | `3` | 最终输出 culprit 数量上限 |
+| `PLUGIN_SCENARIO_TRIGGER_FACTOR` | `1.3` | 场景点亮阈值：窗口均值 `current ≥ baseline × factor` 才点亮 |
+| `PLUGIN_TPM_CAP_FACTOR` | `1.5` | `input_too_long` 限流建议：`tpm_limit = baseline_tpm × factor` |
+| `PLUGIN_OUTPUT_CAP_FACTOR` | `1.5` | `output_too_long` 限流建议：`max_output = baseline_completion × factor` |
+| `PLUGIN_RPM_SHRINK_FACTOR` | `0.8` | `rpm_increase` 限流建议：`rpm_limit = baseline_rpm × factor`（缩小系数 < 1） |
 | `PLUGIN_TIMEZONE` | `Asia/Shanghai` | ISO 时间无时区时的兜底时区 |
 
 ## 4. 工作流
@@ -65,13 +69,17 @@ Round 2  (1 次 API)
 └─ baseline: 每候选 × 每偏移 = 历史均值
 
 评分
-├─ 四类 excess = max(metric_window - baseline_window, 0)
+├─ 三类 excess = max(metric_window - baseline_window, 0)  (rpm / 输入 / 输出)
 ├─ 用户间归一化为 ratio
-├─ 按事件 scope 选权重 (ttft_only / tpot_only / both)
-└─ Top-K culprit + driver_signal + length_signal
+├─ 按事件 scope 选三维权重 (ttft_only / tpot_only / both)
+├─ 按 bScore 排序取 Top-K culprit
+└─ 每 culprit 按 scope 门控点亮场景 + 给出 remediation
+       (rpm_increase / input_too_long / output_too_long；
+        窗口均值 current ≥ baseline × trigger_factor 才点亮)
 ```
 
-详细算法语义见仓库根目录 `ANOMALY_DETECTION_LOGIC.md` 与 `docs/workflow.md`。
+事件检测与候选选择的算法语义见仓库根目录 `ANOMALY_DETECTION_LOGIC.md` 与 `docs/workflow.md`。
+注意：三维评分权重与「三场景 + remediation」为本插件特有（root 文档描述的是 `code/` 旧版的四维 `driver_signal / length_signal` 模型），场景字段定义以本文 §5.3 为准。
 
 ## 5. 输出说明
 
@@ -106,14 +114,38 @@ stdout（实际通过 `logging.basicConfig` 输出到 stderr，与示例插件�
 | --- | --- |
 | `domain_id` | 租户 ID |
 | `is_alert_reporter` | 是否为入参 `domain_id`（告警上报者） |
-| `score` | 加权综合得分 |
+| `score` | 加权综合得分（三维 bScore） |
 | `score_ratio` | 该 culprit 在所有候选中的得分占比 |
-| `driver_signal` | 主导信号：`rpm_rise_dominant / input_shift_dominant / rpm_input_mixed / ...` |
-| `length_signal` | 长度信号：`traffic_dominant / input_shift_dominant / output_shift_dominant / io_shift_joint / length_shift_mixed` |
-| `rpm_excess_ratio` / `tpm_excess_ratio` | 流量类指标超基线占比 |
-| `prompt_delta_ratio` / `completion_delta_ratio` | 长度类指标超基线占比 |
+| `scenarios` | 该租户点亮的场景数组（按 `trigger.ratio` 降序）；结构见 §5.3。可能为空数组 |
+| `warning` | 仅当存在因 baseline 缺失被抑制的场景时出现：`baseline_unavailable: <类型列表>` |
+| `note` | 仅当 `scenarios` 为空时出现：`no_scenario_triggered` |
 | `peak_time` | 该 culprit 综合得分峰值的分钟，ISO 8601 带 tz |
 | `peak_rpm / peak_tpm / peak_ttft / peak_tpot / peak_prompt_tokens / peak_completion_tokens` | 峰值时刻各指标原值 |
+
+### 5.3 `scenario` 字段
+
+每个 culprit 的 `scenarios` 是一个数组，元素为已点亮的场景对象。场景共三类，按 event `scope` 物理门控：`ttft_only` 仅允许 `rpm_increase / input_too_long`，`tpot_only` 仅允许 `output_too_long`，`both` 三者皆可。点亮条件为窗口均值 `current ≥ baseline × PLUGIN_SCENARIO_TRIGGER_FACTOR`。
+
+| 场景 `type` | 触发指标 | 解决方案（remediation） |
+| --- | --- | --- |
+| `rpm_increase` | `rpm` | `action=throttle_rpm`，`target_metric=rpm`，`recommended_value = baseline_rpm × PLUGIN_RPM_SHRINK_FACTOR` |
+| `input_too_long` | `prompt_tokens` | `action=cap_tpm`，`target_metric=tpm`，`recommended_value = baseline_tpm × PLUGIN_TPM_CAP_FACTOR`（触发看输入长度，限流杠杆落在 TPM） |
+| `output_too_long` | `completion_tokens` | `action=cap_output_length`，`target_metric=completion_tokens`，`recommended_value = baseline_completion × PLUGIN_OUTPUT_CAP_FACTOR` |
+
+每个场景对象的嵌套结构：
+
+| 字段 | 说明 |
+| --- | --- |
+| `type` | 场景类型，见上表 |
+| `trigger.metric` | 触发判定所用指标 |
+| `trigger.current` | 事件窗口内该指标的窗口均值（非 0 均值） |
+| `trigger.baseline` | 该指标的历史同时刻偏移 baseline |
+| `trigger.ratio` | `current / baseline`，也是场景排序键 |
+| `remediation.action` | 建议动作：`throttle_rpm / cap_tpm / cap_output_length` |
+| `remediation.target_metric` | 限流杠杆落在哪个指标 |
+| `remediation.baseline` | 目标指标的 baseline |
+| `remediation.factor` | 放大/缩小系数（对应 `PLUGIN_*_FACTOR`） |
+| `remediation.recommended_value` | 建议阈值 = `baseline × factor` |
 
 ## 6. 示例
 
