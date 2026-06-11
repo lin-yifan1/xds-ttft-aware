@@ -1,12 +1,16 @@
 # MaaS 过载溯源插件
 
-单文件 Python 插件，输入告警五元组，调用 MaaS 数据查询接口，输出告警时刻的系统事件与租户级根因 (culprits)。
+单文件 Python 插件，调用 MaaS 数据查询接口完成过载检测与根因定位。两个入口：
+
+- **反应式（Mode A）** `main.py`：输入告警五元组，输出告警时刻的系统事件与租户级根因 (culprits)。见 §2–§7。
+- **主动巡检（Mode B）** `proactive_main.py`：由定时巡检任务逐服务调用，判断「此刻是否正在过载」，并产出按 `(domain_id, resident_model_id, region)` 维度的过载处理策略 (strategies)。见 §8。
 
 ## 1. 文件
 
 | 文件 | 说明 |
 | --- | --- |
-| `main.py` | 插件主体，自包含。依赖 `numpy`、`pandas`、`requests`。 |
+| `main.py` | 反应式插件主体，自包含。依赖 `numpy`、`pandas`、`requests`。 |
+| `proactive_main.py` | 主动巡检插件主体，自包含（不 import `main.py`），同依赖。 |
 | `README.md` | 本文档。 |
 
 ## 2. 调用方式
@@ -172,3 +176,104 @@ python main.py    # 输出 { "status": "error", "error_type": "InvalidArgs", ...
 - 候选少于 `min_baseline_points=6` 个同时刻历史样本时，该候选 baseline 默认为 0，可能造成评分偏高
 - 严格按 7 个位置参；如需扩展（如 `model_name` 过滤），需要修改 `main.py` 中 `EXPECTED_ARG_COUNT` 与 `run_plugin` 签名
 - 无池子过滤：返回行中 `infer_service_id` 字段为空、或 `success_cnt + error_cnt == 0` 的分钟级数据视为无主聚合/无流量，在 `rows_to_dataframe` 入口处丢弃，不参与算法
+
+## 8. 主动巡检插件 `proactive_main.py`
+
+与 `main.py` 平行的第二入口：maas-monitor 的定时巡检任务（每 5 分钟）逐服务调用，
+检测信号、根因评分与策略产出与反应式版有以下差异。算法语义详见仓库根目录
+`PROACTIVE_INSPECTION_ALGORITHM.md`。
+
+### 8.1 调用方式
+
+```bash
+python proactive_main.py <service_id> <model_name> <time> <maasApiurl> \
+                         <appcode> <applydomainid> <applyprojectid>
+```
+
+入参严格按位置传入，共 7 个，全部必填。与 `main.py` 的差异：第 1 槽位不再是告警上报
+租户（巡检没有上报者），新增 `model_name`（用于 `(P,M)` 过滤、SLA 选表与策略回填）。
+
+| # | 名称 | 含义 |
+| ---: | --- | --- |
+| 1 | `service_id` | `infer_service_id`（被巡检的池子/服务实例） |
+| 2 | `model_name` | 服务承载的模型名 |
+| 3 | `time` | 巡检时刻，ISO 8601 或数字时间戳（同 `main.py` 规则） |
+| 4–7 | `maasApiurl` / `appcode` / `applydomainid` / `applyprojectid` | 同 `main.py` |
+
+### 8.2 专有环境变量（通用项同 `main.py` §3）
+
+| 环境变量 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `PLUGIN_TTFT_SLA` / `PLUGIN_TPOT_SLA` | 按模型表 | 不设时走 SLA 表：模型名含 `glm`（忽略大小写）→ 30000/500，其余 → 10000/150 |
+| `PLUGIN_ENABLE_TPOT` | `0` | 置 1 时 TPOT 也参与事件检测（本轮公司范围仅 TTFT） |
+| `PLUGIN_DOMINANCE_MARGIN` | `1.25` | 多指标触发时最大 ratio ≥ 次大 × margin 才算 dominant，否则 default(mixed) |
+| `PLUGIN_LOOKBACK_MINUTES` | `60` | Round 1 回看窗口 |
+| `PLUGIN_ACTIVE_RECENT_MINUTES` | `5` | 事件末端落在窗口最后 N 分钟内才算「正在过载」 |
+| `PLUGIN_DETECT_ONLY` | `0` | 置 1 时 Step 1 判完即返回（恢复巡检 `allServiceCheckOverLoadResume` 用，省配额） |
+| `PLUGIN_RETRY_MAX` / `PLUGIN_RETRY_BASE_SECONDS` | `3` / `2` | HTTP 429 有界递增退避（appcode 配额 10 次/分钟） |
+
+### 8.3 工作流
+
+```
+Round 1  (1 次 API)
+├─ 过滤: infer_service_id = service_id AND model_name = model_name
+├─ 时间: [time - 60min, time)
+├─ 检测: 仅 TTFT 对 SLA（heavy 单点立判 / mild 连续 N 窗；TPOT 走开关）
+└─ 活跃性: 事件末端须落在窗口最后 5 分钟内，否则 normal（附 inactive_event_count）
+
+⇣ PLUGIN_DETECT_ONLY=1 时到此返回（status 即「是否仍过载」）
+
+候选选择: 事件窗口内 max(TTFT/SLA)+max(TPOT/SLA) 排序取 top N（无强制上报者）
+
+Round 2  (1 次 API)
+├─ 过滤: domain_id IN 候选 AND model_name = model_name
+├─ 时间: [time - 60min - 14d, time - 60min)（止于当前窗口前，天然不混入当前数据）
+└─ baseline: 同时刻偏移均值（同 main.py）
+
+评分: 固定 both 权重 (0.28125, 0.34375, 0.375)，三维全参与 → Top-K culprits
+
+场景分类（单一 dominant + margin）
+├─ 触发指标: rpm / tpm / completion_tokens 各对自身 baseline，ratio ≥ 1.3 算触发
+├─ 恰一个触发 → 该场景；多个 → 最大 ratio ≥ 次大 × 1.25 才 dominant，否则 default
+├─ rpm_rise_dominant → rpm_limit；tpm_rise_dominant → tpm_limit；
+│  output_shift_dominant → compeletion_token_limit；default(mixed) → rpm_limit
+└─ 零触发 → 无策略 + note=no_scenario_triggered
+
+Round 3  (1 次 API，仅对有杠杆的 culprits)
+├─ 过滤: domain_id IN culprits AND model_name = model_name，事件窗口
+├─ 维度: timestamp, domain_id, project_id, resident_model_id, region, infer_service_id
+├─ fan-out: 把流量路由到过载池 P 的 (resident_model_id, region) 集合
+├─ region_total: 该租户经该常驻服务在「所有池子」上的逐分钟总量取非零均值
+└─ value = floor(region_total × s)（s = min(baseline×factor / current, 1)，须 s<1）
+   compeletion_token_limit 例外: value = floor(baseline_completion × 1.5)，不放大
+```
+
+### 8.4 输出说明
+
+顶层在 `main.py` §5 基础上变化：新增 `mode="proactive"`、`sweep`（巡检回显）、`sla`
+（生效 SLA 与来源）、`strategies`；`alert` 改为 `sweep`；normal 时附
+`inactive_event_count`（窗口内已结束的历史事件数）。
+
+`strategies` 数组每行（可直接供 maas-monitor 调 maas-manager
+`POST /v1/maas/om/add/overload/strategy`）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `domain_id` | 根因租户 |
+| `resident_model_id` | 常驻服务 ID（限流执行点） |
+| `region` | 常驻服务所在区域（按站点路由 maas-manager 用） |
+| `process_type` | `rpm_limit` / `tpm_limit` / `compeletion_token_limit`（协议原文拼写，含既定笔误） |
+| `value` | 建议限流值（整数，≥1）；rpm/tpm 为区域放大后的速率，输出长度为 max_token 上限 |
+| `model_name` / `project_id` / `scenario` | 补齐字段：模型名（入参回填）、主导项目（Round 3 按 rpm 份额）、场景溯源 |
+
+`culprit` 在 `main.py` 字段基础上：`scenarios` 数组替换为单个 `scenario` 对象
+（`type / process_type / decision(single|margin|mixed) / trigger_ratios / triggered`），
+新增 `pool_lever`（池级杠杆明细）与 `region_breakdown`（区域放大明细）。
+
+### 8.5 status 与恢复巡检
+
+| status | 含义 |
+| --- | --- |
+| `anomaly` | 存在活跃过载事件（detect-only 模式下不含 culprits/strategies） |
+| `normal` | 无活跃事件；恢复巡检以此判定「过载已恢复」 |
+| `no_data` / `error` | 同 `main.py` |

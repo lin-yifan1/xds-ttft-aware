@@ -1,52 +1,34 @@
-# 主动巡检算法设计（MaaS 流量前哨 · Mode B）
+# 主动巡检算法设计（MaaS 过载溯源 · Mode B）
 
-本文是一份**独立**的算法设计文档，描述在 [REGION_RATE_LIMIT_ALGORITHM.md](REGION_RATE_LIMIT_ALGORITHM.md)（v2，告警驱动）之上新增的「**主动巡检**」能力。术语、Step 2/3/4 全部沿用 v2，本文只新增**入口 + 检测信号 + 调度 + 输出元数据**。
+本文描述与 [REGION_RATE_LIMIT_ALGORITHM.md](REGION_RATE_LIMIT_ALGORITHM.md)（v2，告警驱动）并行的「**主动巡检**」入口，与单文件实现 [plugin/proactive_main.py](plugin/proactive_main.py) 一一对应。
 
-> 与 v2 的关系：v2 是「**告警驱动 + 延迟触发**」——等到 TTFT/TPOT 击穿 SLA 的告警来了才动作。本文是「**自驱动 + 流量触发**」——定时巡检系统总量，在延迟被击穿**之前**就发现流量突增并抢先限流。二者是**并行的两个入口**，在 Step 2 之后**收敛到同一条根因→限流链路**。
+> 与 v2 的关系：v2 是「**告警驱动**」——等 TTFT/TPOT 告警来了才动作，且强制并入告警上报者。本文是「**自驱动**」——maas-monitor 定时巡检任务（每 5 分钟，对应公司设计的 `allServiceCheckOverLoad`）逐服务调用本算法，判断「**此刻是否正在过载**」，若是则定位根因租户并产出按 `(domain_id, resident_model_id, region)` 维度的过载处理策略。二者在 Step 2 之后收敛到同一条根因→限流链路。
 >
-> 参考来源：本文的「系统事件窗口 → 用户严格根因打标」两层结构借鉴了内部 AI QoS 方案的异常检测设计，并对齐到本仓库的 `(P,M)` 检测单元、分钟粒度与 region 限流执行层。它恰好对应 [ANOMALY_DETECTION_LOGIC.md](ANOMALY_DETECTION_LOGIC.md) §10 中被标为「当前未使用的旧逻辑」（ratio 门 / robust-z / growth burst / share-z / abs-z）的**重新启用**，但定位为**主动巡检层**，而非替换现有延迟检测。
+> 本轮检测信号按公司 630 版本范围取 **TTFT**（「本轮版本暂时只参考这个指标」），TPOT 留开关默认关；基于流量总量（RPM/TPM 对季节基线）的前置筛查**推迟**，见 §13。
 
 ---
 
 ## 0. 定位：两个入口模式（Mode A / Mode B）
 
-| 维度 | **Mode A 反应式（现有 v2）** | **Mode B 主动巡检（本文）** |
+| 维度 | **Mode A 反应式（[plugin/main.py](plugin/main.py)）** | **Mode B 主动巡检（[plugin/proactive_main.py](plugin/proactive_main.py)）** |
 | --- | --- | --- |
-| 入口 | 一条告警 `(domain_id, P, M, time)` | 定时巡检遍历一批 `(P, M)` |
-| 触发量 | system **TTFT/TPOT** | system **总量 RPM**（可选 TPM） |
-| 判据 | `metric ≥ SLA` | `S` 相对季节基线突增（ratio / robust-z / growth） |
-| 事件语义 | **已经慢了** | 流量在涨，**可能还没慢**（leading indicator） |
-| 事件 scope | `ttft_only / tpot_only / both` | **无 scope**（`trigger_type = volume`） |
-| 根因排序口径 | `max(ttft/sla, tpot/sla)` | **RPM excess** + 证据门控 |
-| 限流性质 | 正式限流 | **抢先（preemptive）限流 + TTL**，可被告警升级确认 |
-
-**核心洞察**：一个「volume event（流量突增窗口）」可以在延迟仍然健康时就存在。因此它**不能**交给 v2 的延迟版 Step 1（会被判 `normal`），主动巡检必须有自己的事件定义，但产出与告警路径**同构**，复用下游全部限流逻辑。
-
-```mermaid
-flowchart LR
-    A([告警 alert]):::a --> A1["Step 1 延迟检测<br/>TTFT/TPOT ≥ SLA"]:::a
-    S([定时巡检 sweep]):::b --> B1["Step 1' 流量检测<br/>system_rpm: ratio/robust-z/growth"]:::b
-    A1 --> M{{"event 命中"}}:::m
-    B1 --> M
-    M --> RC["Step 2 根因定位<br/>（排序口径按模式不同）"]:::c
-    RC --> RL["Step 3/4 池子目标 + 区域放大<br/>（完全复用，scope-free）"]:::c
-    RL --> O["限流建议<br/>Mode A: 正式 · Mode B: preemptive + TTL"]:::o
-
-    classDef a fill:#e3f2fd,stroke:#1976d2,color:#000
-    classDef b fill:#fff8e7,stroke:#f39c12,color:#000
-    classDef m fill:#ede7f6,stroke:#673ab7,color:#000
-    classDef c fill:#ffffff,stroke:#3498db,color:#000
-    classDef o fill:#ffe9d6,stroke:#e67e22,color:#000
-```
+| 入口 | 一条告警 `(domain_id, P, time)` | 定时巡检逐 `(P, M)` 调用，`time` = 巡检当下 |
+| 触发量 | system TTFT/TPOT ≥ SLA，事件覆盖告警时刻 | system **TTFT** ≥ SLA（TPOT 开关），事件须**活跃**（触及窗口末端） |
+| SLA | 环境变量固定值 | **模型化 SLA 表**（GLM 30s/500ms，其余 10s/150ms），env 可覆盖 |
+| 候选 | Top-N + 强制并入告警上报者 | Top-N，**无上报者** |
+| 评分权重 | 按事件 scope 选三维权重 | **固定 both 权重**（三维全参与） |
+| 场景 | 多场景可同时点亮（scope 门控） | **单一 dominant + margin**，零或一个场景 |
+| 产出 | 池级 remediation 建议 | **strategies**：`(domain_id, resident_model_id, region, process_type, value)` |
+| 恢复判定 | 不涉及 | `PLUGIN_DETECT_ONLY=1` 检测即返，`normal` 即「已恢复」 |
 
 ---
 
 ## 1. 设计目标
 
-1. **提前**：在 SLA 被击穿之前，靠流量总量突增这一 leading indicator 主动发现潜在过载。
-2. **自驱动**：不依赖告警，定时巡检一批 `(P, M)`，自己定义事件、自己定位根因。
-3. **低成本**：巡检覆盖面大，必须把 API 成本与「命中数」而非「全量 `(P,M)` 数」挂钩。
-4. **同构产出 + 可回退**：产出与 v2 同构的 `(租户, 网关, 模型, 指标)` 限流建议，但标记为**抢先**并带 TTL；系统若扛住则自愈，若真的恶化则被告警升级为正式限流。
+1. **自驱动**：不依赖告警。巡检任务每 5 分钟遍历近 5 分钟有流量的服务，逐服务调用本算法；配合公司侧 redis `over_load_service_list` 抑制与恢复巡检任务，构成「巡检 + 告警触发」双保障。
+2. **只报正在发生的过载**：活跃性规则过滤窗口内已结束的历史事件，避免逐轮重复上报，并让恢复巡检靠 `status=normal` 自然判定恢复。
+3. **直接产出可执行策略**：输出与 maas-manager `POST /v1/maas/om/add/overload/strategy` 字段对齐的 strategies 数组，拓扑（常驻服务/region 归属）**由数据查询接口的 `resident_model_id` / `region` 维度驱动**，不依赖外部拓扑配置。
+4. **配额可控**：appcode 限 10 次/分钟。一次巡检 = Round 1（1 次）+ 命中后 Round 2（分页）+ Round 3（1 次）；429 有界退避；恢复巡检走 detect-only 只花 1 次。
 
 ---
 
@@ -54,375 +36,349 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Sched([定时巡检<br/>每 5–10 min]):::entry --> Pick["取「有缓存季节基线」的 (P,M) 集合"]:::process
-    Pick --> Q1
+    Sched([定时巡检 每 5 min<br/>入参: service_id P + model_name M + time]):::entry --> R1
 
-    subgraph P1["Phase 1 便宜粗筛 · 系统层（不查租户历史）"]
+    subgraph S1["Round 1 + Step 1' 检测（池子 × 模型）"]
         direction TB
-        Q1["拉当前短窗口逐租户行 → 求和得 system_rpm[t]<br/>ratio[t] = system_rpm[t] / med[t]（med 来自缓存）"]:::process
-        DET{"volume event?<br/>ratio≥1.10 连续≥N<br/>OR ratio≥1.50 OR robust_z≥4 OR growth≥0.15"}:::decision
-        Q1 --> DET
+        R1["查询 (P,M) 近 60 min 逐租户行<br/>聚合 system_ttft（RPM 加权，忽略 0）"]:::process
+        SLA["按 model_name 查 SLA 表<br/>GLM 30s/500ms · 其余 10s/150ms（env 可覆盖）"]:::process
+        DET{"TTFT 过载？<br/>重度 ≥ SLA×7 单点立判<br/>轻度 > SLA 连续 ≥ 10 窗<br/>（TPOT 开关默认关）"}:::decision
+        ACT{"事件活跃？<br/>末端落在窗口最后 5 min 内"}:::decision
+        R1 --> SLA --> DET
+        DET -->|是| ACT
     end
 
-    DET -->|否| SKIP["该 (P,M) 跳过（零额外查询）"]:::terminate
-    DET -->|是| C1
+    DET -->|否| N0["status = normal / no_data"]:::terminate
+    ACT -->|"否（历史事件）"| N1["status = normal<br/>+ inactive_event_count"]:::terminate
+    ACT -->|是| DO{"PLUGIN_DETECT_ONLY?"}:::decision
+    DO -->|"是（恢复巡检）"| OUT0["status = anomaly · note=detect_only<br/>（不出 culprits/strategies）"]:::final
+    DO -->|否| S2A
 
-    subgraph P2["Phase 2 命中深挖 · 用户层（唯一的历史查询）"]
+    subgraph S2["Step 2' 根因定位（租户层）"]
         direction TB
-        C1["候选 = 窗口内 RPM 贡献 top-N（复用 Phase1 已有租户行）"]:::process
-        C2["拉候选租户 14 天同时刻偏移基线"]:::weight
-        C3["按 RPM excess_sum 排序 + 截断<br/>top_k=3 / 累计≥0.8 / 单个≥0.05"]:::process
-        C4{"证据门控：窗口内<br/>share-z 突增 OR growth-burst ?"}:::decision
-        C1 --> C2 --> C3 --> C4
+        S2A["候选: 窗口内 max(ttft/sla)+max(tpot/sla)<br/>Top-N（无强制上报者）"]:::process
+        S2B["Round 2: 候选 14d 同时刻偏移基线<br/>domain_id IN 候选 + model_name=M<br/>范围止于当前窗口之前"]:::weight
+        S2C["excess 三维归一化 × 固定 both 权重<br/>(0.28125, 0.34375, 0.375)<br/>截断: top_k=3 / 累计≥0.8 / 单个≥0.05"]:::process
+        S2A --> S2B --> S2C
     end
 
-    C4 -->|否| DROP["剔除（被动跟涨，不抢先限）"]:::terminate
-    C4 -->|是| S3["Step 3 池子目标（复用 v2 · scope-free）<br/>s = min(target / current, 1)"]:::weight
-    S3 --> S4["Step 4 区域放大 + fan-out（复用 v2）<br/>region_limit = region_total × s"]:::weight
-    S4 --> OUT["输出 preemptive 限流建议<br/>(租户,网关,模型,指标) + ttl + confidence + trigger_type=volume"]:::final
+    S2C --> CLS
+
+    subgraph S3["场景分类 + 池级杠杆"]
+        direction TB
+        CLS["三触发指标 rpm/tpm/completion<br/>各对 baseline 求 ratio，≥1.3 触发"]:::process
+        DOM{"恰一个触发?<br/>或最大 ratio ≥ 次大×1.25?"}:::decision
+        SC1["dominant 场景<br/>rpm_rise / tpm_rise / output_shift"]:::mark
+        SC2["default(mixed) → rpm_limit<br/>rpm 不可降则按 ratio 兜底次优杠杆"]:::mark
+        LEV["池级杠杆 s = min(baseline×factor / current, 1)<br/>rpm×0.8 · tpm×1.5（须 s<1）<br/>输出: cap = baseline_completion×1.5"]:::process
+        CLS --> DOM
+        DOM -->|是| SC1 --> LEV
+        DOM -->|"否（复合）"| SC2 --> LEV
+    end
+
+    LEV --> R3
+
+    subgraph S4["Round 3 + 区域放大（数据驱动拓扑）"]
+        direction TB
+        R3["一次查询: culprits + M + 事件窗口<br/>维度含 resident_model_id / region / 池子 / 项目"]:::weight
+        FAN["fan-out G(T,P) = 路由到 P 的 (常驻服务, region)<br/>region_total = T 经 g 在所有池子的逐分钟总量均值"]:::weight
+        VAL["value = floor(region_total × s)，下限 1<br/>compeletion_token_limit 例外: 不放大，各 region 同值"]:::weight
+        R3 --> FAN --> VAL
+    end
+
+    VAL --> OUT["status = anomaly + strategies[]<br/>(domain_id, resident_model_id, region,<br/>process_type, value, model_name, project_id, scenario)"]:::final
 
     classDef entry fill:#ffd9b3,stroke:#e67e22,stroke-width:2px,color:#000
     classDef process fill:#ffffff,stroke:#3498db,stroke-width:1.5px,color:#000
     classDef decision fill:#fff3e0,stroke:#e67e22,stroke-width:1.5px,color:#000
-    classDef weight fill:#fff8e7,stroke:#f39c12,stroke-width:1.5px,color:#000
-    classDef terminate fill:#fdecea,stroke:#c0392b,stroke-width:1.5px,color:#000
-    classDef final fill:#ffe9d6,stroke:#e67e22,stroke-width:2px,color:#000
-```
-
-> 颜色：橙=入口/出口，蓝=处理，**米黄=历史查询 / 区域放大（成本与命中数挂钩）**，红=终止/无动作。
-
----
-
-## 3. 术语与数据底座（复用 v2）
-
-- **检测单元** = `(池子 P, 模型 M)`，同 v2。
-- **系统序列** `S[t] = system_rpm[t] = Σ_tenant rpm`，分钟粒度，即 v2 [`_build_system_series`](plugin/main.py:480) 已经产出的 `system_rpm`。
-- **季节基线** `med[t]`：复用 v2 的「14 天同时刻 ±10min 偏移基线」（[`_historical_baselines_by_offset`](plugin/main.py:753)），但在**系统级**（对租户求和后）按「分钟-of-day 偏移」聚合，并**缓存**（见 §7）。
-- 拓扑映射（`endpoint_id ↔ gateway`、`gateway → region`、`model → SLA`）同 v2 §2.2，仅 Step 4 用到。
-
-> 关键点：主动巡检**不引入新的数据维度或新接口**，只是把 v2 已有的 `system_rpm` 序列与偏移基线，从「告警时临时计算」改为「定时巡检 + 缓存」，并换上流量判据。
-
----
-
-## 4. Step 1' — 流量事件检测（系统层）
-
-在 `(P,M)` 的 `S[t] = system_rpm[t]` 上生成异常点 `sys_anom[t]`，再合并成 `events` + `sys_event_mask`。**无 latency scope**。
-
-### 4.1 主门控：ratio 门（过滤日周期正常爬坡）
-
-```text
-med[t]   = 缓存的同分钟-of-day 偏移基线（系统级）
-ratio[t] = S[t] / max(med[t], eps)
-sys_ratio_anom[t] = ratio[t] >= sys_ratio_threshold     # 默认 1.10
-```
-
-含义：要求系统总量相对「同时刻历史」至少上升 10%，避免把正常日内爬坡当异常。
-
-### 4.2 两个确认信号：robust-z 或 growth（二选一）
-
-```text
-# robust-z：用缓存的同时刻 median / MAD（无需重拉历史）
-robust_z[t]  = (S[t] - med_median[t]) / (1.4826 * max(mad[t], eps))
-sys_level_anom[t] = robust_z[t] >= sys_robust_z          # 默认 4.0
-
-# growth：系统增长率（来自当前短窗口）
-growth[t]    = S[t] / (S[t-1] + 1) - 1
-sys_burst[t] = growth[t] >= sys_growth_rate_threshold    # 默认 0.15
-
-sys_anom_normal[t] = sys_ratio_anom[t] AND (sys_level_anom[t] OR sys_burst[t])
-```
-
-### 4.3 单点极端旁路（不漏尖峰）
-
-```text
-sys_anom_extreme[t] = ratio[t] >= sys_extreme_ratio      # 默认 1.50（或 robust_z 极高）
-```
-
-### 4.4 持续门 + 事件合并（分钟级抗抖）
-
-分钟级流量比小时级更抖，因此**沿用 v2 延迟路径的双轨**（[`_detect_system_events`](plugin/main.py:581) 的 `heavy | mark_runs(mild, N)`）：
-
-```text
-# 普通候选必须连续 N 分钟；极端单点豁免持续门
-sys_anom[t] = mark_runs(sys_anom_normal, N) OR sys_anom_extreme[t]       # N 默认 10
-events      = mask_to_events(sys_anom, merge_gap)
-events      = cap_by_peak_ratio(events, max_events)      # 极端单点事件始终保留
-sys_event_mask = union(events);  每个 event 标 trigger_type = "volume"
-```
-
-系统层流程图：
-
-```mermaid
-flowchart TD
-    S["system_rpm[t]（该 (P,M) 对租户求和）"]:::entry --> R{"ratio = S / med ≥ 1.10 ?"}:::decision
-    R -->|否| N0["无异常"]:::ok
-    R -->|是| EX{"极端? ratio ≥ 1.50<br/>OR robust_z 极高"}:::decision
-    EX -->|是 · 极端单点| KEEP["立判异常点（豁免持续门）"]:::mark
-    EX -->|否| CF{"robust_z ≥ 4<br/>OR growth ≥ 0.15 ?"}:::decision
-    CF -->|否| N1["无异常"]:::ok
-    CF -->|是| MILD["候选异常点"]:::mark
-    MILD --> RUN{"连续候选 ≥ N 分钟 ?"}:::decision
-    RUN -->|否| DROP["丢弃（抖动）"]:::terminate
-    RUN -->|是| KEEP
-    KEEP --> MK["mask_to_events 合并 → event"]:::process
-    MK --> OUT["events + sys_event_mask<br/>trigger_type = volume（无 scope）"]:::final
-
-    classDef entry fill:#e8eaf6,stroke:#5c6bc0,stroke-width:2px,color:#000
-    classDef process fill:#ffffff,stroke:#3498db,stroke-width:1.5px,color:#000
-    classDef decision fill:#fff3e0,stroke:#e67e22,stroke-width:1.5px,color:#000
-    classDef mark fill:#e8f4fd,stroke:#3498db,stroke-width:1.5px,color:#000
-    classDef ok fill:#e8f5e9,stroke:#2e7d32,stroke-width:1.5px,color:#000
-    classDef terminate fill:#fdecea,stroke:#c0392b,stroke-width:1.5px,color:#000
-    classDef final fill:#ffe9d6,stroke:#e67e22,stroke-width:2px,color:#000
-```
-
----
-
-## 5. Step 2' — 根因定位（用户层：excess 排序 + 证据门控）
-
-只在 `sys_event_mask` 为真的分钟内评估用户（严格模式，抑制误报）。
-
-### 5.1 候选选择（RPM 口径，替换 v2 的延迟排序）
-
-v2 的 [`_pick_candidates`](plugin/main.py:804) 按 `max(ttft/sla, tpot/sla)` 排序——但 volume 事件可能没有延迟信号，因此改为**按事件窗口内 RPM 贡献排序**取 Top-N（`candidate_top_n` 默认 6）。候选行直接复用 Phase 1 已经拉到的逐租户短窗口数据，**不产生额外查询**。
-
-### 5.2 culprit 截断（excess 排序，同 v2 截断规则）
-
-仅对候选拉取 14 天偏移基线（§7 Phase 2），计算窗口内超额并排序：
-
-```text
-excess[user,t] = max(rpm[user,t] - baseline_rpm[user,t], 0)
-excess_sum[user] = Σ_{t∈[a,b]} excess[user,t]
-按 excess_sum 降序，截断：top_k=3 / 累计占比≥0.8 / 除头名外单个≥0.05
-```
-
-### 5.3 证据门控（share-z 或 growth-burst，抑制被动跟涨）
-
-被排序选中只说明「量大」，还须有「主动突增」的证据才保留为 culprit（否则可能是系统过载后被动跟涨的正常大户）：
-
-```text
-# 份额异常 share-z
-P[user,t] = rpm[user,t] / max(S[t], 1)
-zP        = z(P, past-only rolling mean/std)         # shift(1) 后 rolling
-share_anom    = zP > share_z            # 默认 3.0
-share_extreme = zP > share_z_extreme    # 默认 5.0
-
-# 用户增长爆发 growth-burst
-g[user,t]    = rpm[user,t] / (rpm[user,t-1] + 1) - 1
-growth_flag  = g >= growth_rate_threshold            # 默认 0.8
-growth_burst = 过去 growth_window 分钟内 growth_flag 命中 ≥ growth_min_hits   # 窗口 3min / 命中 1
-
-keep_as_culprit = share_anom OR growth_burst
-```
-
-> 与参考设计的对齐：这等价于参考的 `flags_overload = (share_anom AND (growth_burst OR share_extreme)) OR abs_z_extreme` 的精简版——本文把「绝对量」证据交给 §5.2 的 excess 排序承担，门控层只保留 share / growth 两类「主动突增」证据，避免重复。完整 `abs-z` / `episode 回填` / `reason` 标签属于解释性输出，列为可选（§12）。
-
-用户层流程图：
-
-```mermaid
-flowchart TD
-    EVT["进入 volume event 窗口 [a,b]<br/>（仅 sys_event_mask=True 的分钟）"]:::entry --> CAND["候选 = 窗口内 RPM 贡献 top-N"]:::process
-    CAND --> BASE["拉候选 14 天同时刻偏移基线"]:::weight
-    BASE --> RANK["按 excess_sum 降序 + 截断<br/>top_k=3 / 累计≥0.8 / 单个≥0.05"]:::process
-    RANK --> GATE{"证据门控：窗口内<br/>share-z 突增 OR growth-burst ?"}:::decision
-    GATE -->|否| DROP["剔除（被动跟涨，不抢先限）"]:::terminate
-    GATE -->|是| CULP["保留为 culprit"]:::mark
-    CULP --> LEV["逐 metric 评估杠杆<br/>rpm 必评 · tpm 若也突增则评<br/>触发: current ≥ baseline×1.3"]:::process
-    LEV --> S34["→ Step 3 / Step 4"]:::final
-
-    classDef entry fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000
-    classDef process fill:#ffffff,stroke:#3498db,stroke-width:1.5px,color:#000
-    classDef decision fill:#fff3e0,stroke:#e67e22,stroke-width:1.5px,color:#000
     classDef mark fill:#e8f4fd,stroke:#3498db,stroke-width:1.5px,color:#000
     classDef weight fill:#fff8e7,stroke:#f39c12,stroke-width:1.5px,color:#000
     classDef terminate fill:#fdecea,stroke:#c0392b,stroke-width:1.5px,color:#000
     classDef final fill:#ffe9d6,stroke:#e67e22,stroke-width:2px,color:#000
 ```
 
----
-
-## 6. Step 3 / Step 4 — 完全复用 v2
-
-对每个 culprit `(T, M)`，**原样套用** v2 §5 / §6：
-
-- **Step 3 池子目标（scope-free）**：volume 事件天然点亮 **RPM 杠杆**（`current_rpm ≥ baseline_rpm × 1.3` → `target = baseline_rpm × 0.8`）；若 TPM 也突增则独立点亮 TPM 杠杆。`s_metric = min(target/current, 1)`，仅 `s<1` 才产出。
-- **Step 4 区域放大 + fan-out**：`region_limit[g] = region_total[g] × s`，对池子 P 路由到的每个网关施加同一个 `s`。正确性论证、退化情形、collateral 同 v2 §6.1–§6.3。
-
-> 因为 Step 3 在 v2 里本就是「统一、scope-free」，仅用 RPM/TPM 杠杆 + 偏移基线，所以无 scope 的 volume 事件可以**无缝**进入，不需要任何改动。
+> 颜色：橙=入口/出口，蓝=处理，浅蓝=场景标记，**米黄=历史/区域查询（成本与命中数挂钩）**，红=终止/无动作。
 
 ---
 
-## 7. 调度与成本（两阶段巡检）
+## 3. 入口契约
 
-主动巡检的覆盖面远大于单条告警，成本结构是设计关键。把 v2 的 Round1/Round2 改造为「**缓存系统基线 + 命中再拉租户基线**」：
+7 个位置参数（`model_name` 顶替 Mode A 的 `domain_id` 槽位）：
 
-| 阶段 | 频率 | 查询 | 说明 |
-| --- | --- | --- | --- |
-| **基线刷新** | 每天 1 次 | 每个 `(P,M)` 拉 14 天系统级历史 | 预计算并缓存同时刻偏移 `{median, MAD, count}`，供 ratio 门 + robust-z 使用 |
-| **Phase 1 粗筛** | 每 5–10 min | 每个 `(P,M)` 拉 1 次短窗口逐租户行 | 求和得 `system_rpm`，对缓存基线算 ratio / robust-z / growth；**未命中即止，零历史查询** |
-| **Phase 2 深挖** | 仅命中时 | 仅候选租户拉 1 次 14 天偏移基线 | 即 v2 的 Round 2，只为命中 `(P,M)` 的 Top-N 候选 |
-
-**成本结论**：每轮的历史查询量 ≈ `命中 (P,M) 数 × 1`，而非 `全量 (P,M) 数 × 14 天`。Phase 1 只做短窗口聚合查询，便宜且可并发。robust-z 因为吃缓存的 median/MAD，也无需在巡检时重拉历史。
-
-> 巡检范围 = 「有缓存季节基线」的 `(P,M)` 集合。新 `(P,M)` 在攒够 `min_baseline_points` 历史前不参与巡检（等价于参考设计的 warm-up）。
-
----
-
-## 8. 抢先限流生命周期（TTL + 升级确认）
-
-抢先限流基于「还没真痛」的流量信号，必须可自愈，避免「系统其实扛住了」的长期误限。**算法侧只产元数据，执行/撤销由 MaaS-manager 据此决策**：
-
-```text
-每条 preemptive remediation 附带：
-  preemptive   = true
-  ttl_minutes  = 45              # 到期未被确认则自动撤销
-  confidence   ∈ [0,1]           # 由事件强度映射，供 MaaS-manager 排序/取舍
+```
+service_id  model_name  time  maasApiurl  appcode  applydomainid  applyprojectid
 ```
 
-- **自愈**：TTL 到期且期间未出现同 `(T, 网关, M)` 的延迟告警 → 自动撤销。
-- **升级确认**：TTL 内若同 `(T, 网关, M)` 真的触发 Mode A 延迟告警 → 升级为正式限流并刷新（去掉 TTL）。
-- **合并**：同 `(租户, 网关, 模型, 指标)` 的多条建议（跨 `(P,M)` 或跨模式）取并/取最严，沿用 v2 §10 交 MaaS-manager。
+- `service_id`：被巡检的池子（`infer_service_id`）。巡检范围（近 5 分钟有流量的服务）由 maas-monitor 调度侧确定。
+- `model_name`：用于 (1) Round 1/2/3 的 `model_name` 过滤（v2 的 `(P,M)` 检测单元）；(2) SLA 选表；(3) strategies 回填（maas-manager add-strategy 接口必填）。
+- `time`：巡检当下时刻（回放/测试时可传历史时刻）。
+
+**SLA 表**（[`resolve_sla`](plugin/proactive_main.py)）：模型名含 `glm`（忽略大小写）→ `(30000ms, 500ms)`，其余 → `(10000ms, 150ms)`；`PLUGIN_TTFT_SLA` / `PLUGIN_TPOT_SLA` 显式设置时覆盖表值。
 
 ---
 
-## 9. 输出契约（在 v2 §7 基础上的增量）
+## 4. Step 1' — 检测与活跃性（系统层）
 
-顶层沿用 v2：`status ∈ {anomaly, normal, no_data, error}`；主动巡检额外加：
+### 4.1 事件检测（沿用 v1/v2 双档逻辑，信号收窄）
+
+对 `(P,M)` 近 `lookback_minutes`(60) 分钟逐租户行聚合出 `system_ttft`（RPM 加权、忽略 0），然后：
+
+```text
+heavy = system_ttft ≥ sla × severe_ratio          # 单点立判（默认 7）
+mild  = system_ttft > sla                         # 轻度
+anom  = heavy ∨ mark_runs(mild, N)                # 连续 ≥ N 窗（默认 10）
+events = cap_by_peak(mask_to_events(anom), max_events)
+```
+
+`PLUGIN_ENABLE_TPOT=1` 时 TPOT 按同样双档并入 `anom`（默认关，与公司本轮「只参考 TTFT」一致）。TPOT 序列始终参与候选排序与 `system_stats` 诊断输出。
+
+### 4.2 活跃性规则（Mode B 专有）
+
+反应式版的命中条件是「事件覆盖告警时刻」；巡检没有告警时刻，`time` 就是当下。60 分钟窗口里可能躺着早已结束的历史事件——若直接上报，会被后续每轮巡检重复报告，且恢复巡检永远等不到 `normal`。因此：
+
+```text
+活跃 ⇔ 事件末端 b ≥ point_count − active_recent_minutes      # 默认 5，与巡检周期对齐
+多个活跃事件 → 取末端最新者，再以 TTFT 峰值比破并列
+无活跃事件   → status = normal + inactive_event_count（窗口内已结束事件数）
+```
+
+### 4.3 detect-only（恢复巡检）
+
+公司侧恢复巡检任务（`allServiceCheckOverLoadResume`）只需要「还过载吗」一个布尔答案。`PLUGIN_DETECT_ONLY=1` 时 Step 1' 判完即返回（`anomaly` = 仍过载，`normal` = 已恢复），不跑 Round 2/3，单次仅 1 次 API 调用。
+
+---
+
+## 5. Step 2' — 根因定位（租户层）
+
+1. **候选**：事件窗口内按 `max(ttft/sla) + max(tpot/sla)` 取 Top-N（`candidate_top_n`=6）。无告警上报者，不做强制并入。
+2. **基线（Round 2）**：`domain_id IN 候选 + model_name = M`，范围 `[time − 60min − 14d, time − 60min)`——止于当前窗口之前，当前数据**天然不混入**自身基线；同时刻偏移聚合同 v1/v2（`min_baseline_points`=6）。
+3. **评分**：三维 excess（rpm / prompt / completion）用户间归一化后加权：
+
+   ```text
+   score = 0.28125·rpm_ratio + 0.34375·prompt_ratio + 0.375·completion_ratio
+   ```
+
+   **固定使用 both 权重，不随 scope 变化**。原因：默认 TTFT-only 检测下 scope 恒为 `ttft_only`，若沿用 scope 选权重会把输出维清零，纯输出激增租户永远选不进 culprit，`output_shift_dominant` 场景不可达；物理上 continuous batching 下重 decode 负载同样会推高 TTFT。scope 仍计算并随事件输出，仅作元数据。
+4. **截断**：同 v1/v2（`top_k`=3 / 累计 ≥0.8 / 除头名外单个 ≥0.05 / score ≤ 0 停）。
+
+> prompt_tokens 不再是场景触发指标（§6），但保留在评分维度中依然自洽：输入超长租户靠 prompt excess 被选中后，tpm（含输入 token）大概率同步激增，分类落 `tpm_rise_dominant` → TPM 限流，等价于旧 `input_too_long → cap_tpm` 链路。
+
+---
+
+## 6. 场景分类 — 单一 dominant + margin
+
+对每个 culprit 在事件窗口的均值（非 0 均值）与基线，计算三个触发 ratio 并裁决出**至多一个**场景（[`classify_scenario`](plugin/proactive_main.py)）：
+
+| 触发指标 | 场景 `type` | `process_type` |
+| --- | --- | --- |
+| `rpm` | `rpm_rise_dominant` | `rpm_limit` |
+| `tpm` | `tpm_rise_dominant` | `tpm_limit` |
+| `completion_tokens` | `output_shift_dominant` | `compeletion_token_limit` |
+| —（复合） | `default` | `rpm_limit` |
+
+> `process_type` 取值为**协议原文拼写**（`compeletion` 为公司策略 JSON、maas-manager 接口与 DB 表一致的既定笔误），不可"修正"。
+
+裁决规则：
+
+```text
+ratio[m] = current[m] / baseline[m]          # baseline 缺失的指标记 suppressed，不参与
+triggered = { m | ratio[m] ≥ trigger_factor }            # 默认 1.3
+|triggered| = 0 → 无场景（note=no_scenario_triggered，不出策略）
+|triggered| = 1 → 该场景（decision=single）
+|triggered| ≥ 2 → 最大 ratio ≥ 次大 × dominance_margin   # 默认 1.25
+                  ? 最大者场景（decision=margin）
+                  : default/mixed → rpm_limit（decision=mixed）
+```
+
+**margin 的必要性**：输出激增通常连带抬高 TPM（tpm 含输出 token）。若规则是「≥2 个触发即 mixed」，纯输出激增客户（completion ratio 2.0、连带 tpm 1.4）会被误判 default 去限 RPM；有 margin 后 `2.0 ≥ 1.4×1.25` 判 output dominant，落到正确的 `compeletion_token_limit`。
+
+**池级杠杆**（[`compute_pool_lever`](plugin/proactive_main.py)）：
+
+```text
+rpm_limit:  target = baseline_rpm × rpm_shrink_factor(0.8)；s = min(target/current, 1)，须 s<1
+tpm_limit:  target = baseline_tpm × tpm_cap_factor(1.5)；同上
+            ⇒ ratio ∈ [1.3, 1.5) 时 s≥1 不产出（基线之上设帽的已知不对称，同 v2 §5）
+compeletion_token_limit: cap = baseline_completion × output_cap_factor(1.5)
+            ⇒ max_token 语义的长度上限，「基线之上设顶」的预防性限制，恒可计算
+```
+
+- dominant 场景只评估自身杠杆，不可降（s≥1 / baseline 缺失）则该 culprit 不出策略，打 note。
+- `default(mixed)` 按公司口径落 `rpm_limit`；rpm 不可降（如 mixed 由 tpm+completion 触发而 rpm baseline 缺失，或 current 已低于 0.8×baseline）时，沿触发指标按 ratio 降序**兜底到次优杠杆**，`process_type` 随之切换并打 `default_fallback_to_*` warning。
+
+---
+
+## 7. Round 3 — 区域放大 + fan-out（拓扑由数据驱动）
+
+v2 Step 4 假定「池子↔网关拓扑作为算法输入」；现在数据查询接口已支持 `resident_model_id`（常驻服务 ID）与 `region`（常驻服务所在区域）维度，拓扑改为**从数据里查出来**。对所有有杠杆的 culprits 发**一次**查询：
+
+```text
+filter:  domain_id IN culprits + model_name = M + timestamp ∈ 事件窗口 [a,b]
+dims:    [timestamp, domain_id, project_id, resident_model_id, region, infer_service_id]
+```
+
+注意**不过滤** `infer_service_id`，但把它放进维度——一次查询同时得到两样东西：
+
+1. **fan-out 集合** `G(T,P)`：哪些 `(常驻服务 g, region)` 把 T 的流量路由到了过载池 P（看 `infer_service_id = P` 的行）；
+2. **区域总量** `region_total[g]`：T 经 g 在**所有池子**上的逐分钟总量（对池子求和）取非零均值——v2 放大公式的分母口径。
+
+```text
+value[g] = floor(region_total[g] × s)，下限 1        # 同一个 s 逐网关放大，正确性论证同 v2 §6.1
+compeletion_token_limit 例外: value = floor(cap)，不放大，各 region 行同值（长度非速率）
+project_id[g] = g 下按 rpm 份额最大的项目              # add-strategy 接口补齐字段
+```
+
+不路由到 P 的常驻服务不进 fan-out（不被限流），但其流量计入该常驻服务自身的 `region_total` 口径之外——只有 `g ∈ G(T,P)` 的行才产出策略。Round 3 无可用行（常驻/region 字段为空等）时打 `resident_breakdown_unavailable`，该 culprit 不出策略。
+
+---
+
+## 8. 输出契约
+
+顶层：`status ∈ {anomaly, normal, no_data, error}` 同 Mode A；新增 `mode="proactive"`、`sweep`（巡检回显）、`sla`（生效 SLA 与来源）、`strategies`；normal 时附 `inactive_event_count`。
 
 ```jsonc
 {
   "status": "anomaly",
-  "mode": "proactive",                       // 新增：区分 Mode A/B
-  "detection": {                             // 新增：本次 (P,M) 的巡检证据
-    "endpoint_id": "P", "model_name": "M",
-    "trigger_type": "volume",                // 无 latency scope
-    "peak_ratio": 1.7, "robust_z": 6.2, "growth": 0.31,
-    "system_peak_rpm": 1700, "system_peak_rpm_time": "…"
-  },
-  "event": { "start": "…", "end": "…", "duration_minutes": 12 },   // 无 scope 字段
+  "mode": "proactive",
+  "sweep": { "service_id": "P", "model_name": "M", "checked_at": "…",
+             "lookback_minutes": 60, "active_recent_minutes": 5, "detect_only": false },
+  "sla": { "ttft_sla": 10000, "tpot_sla": 150,
+           "tpot_detection_enabled": false, "source": "model_table:default" },
+  "events": [
+    { "start": "…", "end": "…", "duration_minutes": 12, "scope": "ttft_only",
+      "system_peak_ttft": 81234, "system_peak_ttft_time": "…",
+      "system_peak_tpot": 42, "system_peak_tpot_time": "…" }
+  ],
   "culprits": [
     {
-      "domain_id": "T", "model_name": "M", "endpoint_id": "P",
-      "evidence": { "share_z": 4.1, "growth_burst": true },        // 新增：门控证据
-      "excess_sum_rpm": 0.0, "excess_ratio": 0.0,
-      "peak_time": "…", "peak_rpm": 0,
-      "remediations": [
-        {
-          "gateway_id": "…", "region": "贵阳", "target_metric": "rpm",
-          "pool":   { "endpoint_id": "P", "current": 100, "target": 50, "baseline": 62.5, "s": 0.5 },
-          "region": { "current_total": 1000, "recommended_limit": 500, "factor": 0.8 },
-          "fanout_gateways": ["贵阳","香港"],
-          "preemptive": true, "ttl_minutes": 45, "confidence": 0.78    // 新增
-        }
-      ]
+      "domain_id": "T", "score": 0.91, "score_ratio": 0.95,
+      "scenario": {
+        "type": "rpm_rise_dominant", "process_type": "rpm_limit",
+        "decision": "single",                       // single | margin | mixed
+        "trigger_ratios": { "rpm": 10.0, "tpm": 1.1, "completion_tokens": 1.0 },
+        "triggered": ["rpm"]
+      },
+      "process_type": "rpm_limit",                  // 兜底后最终值
+      "pool_lever": { "metric": "rpm", "kind": "rate_scale",
+                      "current": 100, "baseline": 10, "factor": 0.8,
+                      "target": 8, "s": 0.08 },
+      "region_breakdown": [
+        { "resident_model_id": "g1", "region": "贵阳", "project_id": "p1",
+          "region_total": 100.0, "s": 0.08, "value": 8 }
+      ],
+      "peak_time": "…", "peak_rpm": 100, "peak_tpm": 1100, "peak_ttft": 80000,
+      "peak_tpot": 40, "peak_prompt_tokens": 100, "peak_completion_tokens": 100
+      // 可选: "warning": "baseline_unavailable: tpm; default_fallback_to_…"
+      // 可选: "note": "no_scenario_triggered | lever_not_computable: … | resident_breakdown_unavailable"
     }
-  ]
+  ],
+  "strategies": [                                   // 直接供 maas-monitor 调 add-strategy
+    { "domain_id": "T", "resident_model_id": "g1", "region": "贵阳",
+      "process_type": "rpm_limit", "value": 8,
+      "model_name": "M", "project_id": "p1", "scenario": "rpm_rise_dominant" }
+  ],
+  "system_stats": { "...": "同 Mode A，含 ttft/tpot/rpm/tpm/输入/输出 的均值、P95、最大值" },
+  "config_echo": { "...": "全部 PluginConfig 字段" },
+  "api_call_count": 3,
+  "history_baseline": { "candidates": ["T", "…"], "history_rows": 280,
+                        "history_days": 14, "history_window_end": "…" }
 }
 ```
 
+推送 maas-manager（按 region 路由站点）、CMA 告警、redis 抑制标记均为 maas-monitor 职责，本算法**只输出不推送**。
+
 ---
 
-## 10. 参数表（粗体为本文新增 / 重定义）
+## 9. 调度与成本
+
+| 轮次 | 条件 | 查询 | 量级 |
+| --- | --- | --- | --- |
+| Round 1 | 每次巡检 | (P,M) 近 60 min 逐租户行 | 1 次（短窗口，通常 1 页） |
+| Round 2 | 仅命中活跃事件 | 候选 14d 连续范围（同时刻偏移本地聚合） | 1 次起，租户数据密时多页 |
+| Round 3 | 仅有杠杆 culprit | culprits × 事件窗口 × 常驻/region 维度 | 1 次（≤3 租户 × ≤60 min，1~2 页） |
+
+- **appcode 配额 10 次/分钟**是硬约束：未命中的巡检只花 1 次；命中才进入 Round 2/3。`MaasClient` 对 429 做有界递增退避（默认 3 次、sleep `base×k` 秒），耗尽仍 429 则报 `error`，由下一轮巡检（5 分钟后）自然重试。
+- 恢复巡检走 detect-only，每服务每轮恒 1 次。
+
+---
+
+## 10. 参数表（粗体为 Mode B 新增 / 重定义）
 
 | 参数 | 默认 | 阶段 | 说明 |
 | --- | ---: | --- | --- |
-| **`sys_ratio_threshold`** | 1.10 | 巡检检测 | ratio 门 |
-| **`sys_extreme_ratio`** | 1.50 | 巡检检测 | 单点极端旁路 |
-| **`sys_robust_z`** | 4.0 | 巡检检测 | robust-z 确认阈 |
-| **`sys_growth_rate_threshold`** | 0.15 | 巡检检测 | 系统增长确认阈 |
-| `mild_consecutive_windows` (N) | 10 | 巡检检测 | 持续门（分钟），复用 v2 |
-| **`share_z` / `share_z_extreme`** | 3.0 / 5.0 | 巡检根因 | 份额异常门控 |
-| **`growth_rate_threshold`** | 0.8 | 巡检根因 | 用户增长门控 |
-| **`growth_window` / `growth_min_hits`** | 3min / 1 | 巡检根因 | growth-burst |
-| `candidate_top_n` | 6 | 巡检根因 | 候选数（复用 v2） |
-| `culprit_top_k / cum_ratio / min_ratio` | 3 / 0.8 / 0.05 | 巡检根因 | 截断（复用 v2） |
-| `history_days / same_time_minutes / min_baseline_points` | 14 / 10 / 6 | 基线 | 同时刻偏移基线（复用 v2） |
-| `scenario_trigger_factor` | 1.3 | 限流 | 杠杆触发（复用 v2 Step 3） |
-| `rpm_shrink_factor` / `tpm_cap_factor` | 0.8 / 1.5 | 限流 | 复用 v2 Step 3 |
-| **`sweep_interval`** | 5–10 min | 调度 | 巡检周期 |
-| **`sweep_lookback`** | 30–60 min | 调度 | 每轮短窗口长度（够算持续门 + growth） |
-| **`baseline_refresh`** | 24h | 调度 | 季节基线缓存刷新周期 |
-| **`ttl_minutes`** | 45 | 生命周期 | 抢先限流有效期 |
+| **`ttft_sla / tpot_sla`** | 模型表（GLM 30s/500ms，其余 10s/150ms） | 检测 | `PLUGIN_TTFT_SLA` / `PLUGIN_TPOT_SLA` 覆盖 |
+| **`enable_tpot`** | 0 | 检测 | TPOT 参与检测开关（本轮公司范围仅 TTFT） |
+| `severe_ratio` | 7 | 检测 | 重度倍率（复用） |
+| `mild_consecutive_windows` | 10 | 检测 | 轻度连续窗（复用） |
+| **`lookback_minutes`** | 60 | 检测 | Round 1 回看窗口（公司口径「近期 1h」） |
+| **`active_recent_minutes`** | 5 | 检测 | 活跃性规则，与巡检周期对齐 |
+| **`detect_only`** | 0 | 调度 | 恢复巡检模式 |
+| `candidate_top_n` | 6 | 归因 | 候选数（复用，无上报者并入） |
+| `culprit_top_k / cum_ratio / min_ratio` | 3 / 0.8 / 0.05 | 归因 | 截断（复用） |
+| `history_days / min_baseline_points` | 14 / 6 | 基线 | 同时刻偏移基线（复用） |
+| **评分权重** | (0.28125, 0.34375, 0.375) | 归因 | 固定 both 权重，不随 scope |
+| `scenario_trigger_factor` | 1.3 | 场景 | 触发阈（复用） |
+| **`dominance_margin`** | 1.25 | 场景 | 多触发时 dominant 裁决 |
+| `rpm_shrink_factor / tpm_cap_factor / output_cap_factor` | 0.8 / 1.5 / 1.5 | 杠杆 | 复用 v2/v1 语义 |
+| **`retry_max / retry_base_seconds`** | 3 / 2 | HTTP | 429 有界递增退避 |
+| **`sweep_interval`** | 5 min | 调度 | 巡检周期（maas-monitor 侧，非本插件参数） |
 
 ---
 
-## 11. 端到端伪代码（对照 v2 §11）
+## 11. 端到端伪代码
 
 ```python
-def run_proactive_sweep(topo, sla_table, cache, now):
-    out = []
-    for (P, M) in cache.pairs_with_seasonal_baseline():            # 巡检范围 = 有缓存基线的 (P,M)
-        # ---- Phase 1: 便宜粗筛（系统层，零历史查询）----
-        rows = query(P, M, recent_window(now, SWEEP_LOOKBACK))     # 按 (ts, domain_id) 返回逐租户行
-        if not rows:
-            continue
-        S          = system_rpm_series(rows)                       # Σ_tenant rpm，= v2 _build_system_series
-        med, mad   = cache.seasonal(P, M)                          # 缓存的同时刻 median / MAD
-        ratio      = S / clip(med, eps)
-        robust_z   = (S - med) / (1.4826 * clip(mad, eps))
-        growth     = S / (shift(S, 1) + 1) - 1
-        normal     = (ratio >= 1.10) & ((robust_z >= 4.0) | (growth >= 0.15))
-        sys_anom   = mark_runs(normal, N) | (ratio >= 1.50)        # 持续门 | 极端单点
-        ev = event_covering(now, mask_to_events(sys_anom))
-        if ev is None:
-            continue
+def run_proactive(P, M, now, cfg):
+    ttft_sla, tpot_sla = sla_table(M, cfg)                       # 模型化 SLA
 
-        # ---- Phase 2: 命中深挖（用户层，唯一的历史查询）----
-        cands = rank_by_rpm_contribution(rows, ev, top_n=6)        # 复用 Phase1 已有租户行
-        base  = baselines_by_offset(cands, P, M)                   # 仅候选拉 14 天偏移基线
-        culprits = []
-        for T in topk_by_excess(cands, base, ev):                  # excess 排序 + 截断
-            if not (share_z_anom(T, S, ev) or growth_burst(T, ev)):# 证据门控
-                continue
-            recs = []
-            for metric in ("rpm", "tpm"):                          # Step 3 复用 v2
-                cur = window_mean(P, T, M, metric, ev)
-                bl  = base[T, metric]
-                if bl is None or cur < bl * 1.3:
-                    continue
-                target = bl * (RPM_SHRINK if metric == "rpm" else TPM_CAP)
-                s = min(target / cur, 1.0)
-                if s >= 1.0:
-                    continue
-                for g in topo.gateways_of(P):                       # Step 4 复用 v2
-                    rt = region_total(g, T, M, metric, ev)
-                    recs.append(remediation(g, metric, cur, target, bl, s, rt,
-                                            preemptive=True,
-                                            ttl_minutes=TTL,
-                                            confidence=conf(ratio, robust_z, growth)))
-            culprits.append(culprit_record(T, M, P, recs, evidence=(share, growth)))
-        if culprits:
-            out.append(anomaly(P, M, ev, culprits, mode="proactive"))
-    return out
+    rows  = query(P, M, [now - 60min, now))                      # Round 1
+    if not rows: return no_data()
+    S_ttft = system_ttft(rows)                                   # RPM 加权聚合
+    events = detect(S_ttft, ttft_sla, heavy=7, mild_run=10)      # (+TPOT if 开关)
+    ev = pick_active(events, tail=cfg.active_recent_minutes)     # 活跃性规则
+    if ev is None: return normal(inactive=len(events))
+    if cfg.detect_only: return anomaly(ev, note="detect_only")   # 恢复巡检到此为止
+
+    cands = top_n_by_latency(rows, ev)                           # 无上报者并入
+    base  = offset_baselines(cands, M, [now-60min-14d, now-60min))   # Round 2
+    culprits = topk_by_weighted_excess(cands, base, ev, W_BOTH)  # 固定 both 权重
+
+    for T in culprits:                                           # 场景 + 杠杆
+        scenario = classify(ratios(T, base), trigger=1.3, margin=1.25)
+        if scenario is None: continue
+        lever = pool_lever(scenario, T, base)                    # s<1 或 length cap
+        if lever is None: continue
+
+    r3 = query(culprits, M, ev, dims=[…, project, resident, region, pool])  # Round 3
+    strategies = []
+    for T in culprits_with_lever:
+        for (g, region) in fanout(r3, T, P):                     # 路由到 P 的常驻服务
+            total = window_mean(per_minute_sum(r3, T, g, lever.metric))     # 跨池总量
+            value = floor(total * lever.s) if lever.rate else floor(lever.cap)
+            strategies.append((T, g, region, lever.process_type, max(value, 1),
+                               M, dominant_project(r3, T, g), scenario.type))
+    return anomaly(ev, culprits, strategies)
 ```
 
 ---
 
-## 12. 假定与未决（可调）
+## 12. 与 Mode A / 公司链路的对照
 
-1. **TPM 作为第二触发信号**：默认只在 `system_rpm` 上检测，`tpm` 仅作 Step 3 杠杆。是否也在 `system_tpm` 上跑同一套门——建议先留开关，默认关。
-2. **`confidence` 公式**：示意 `confidence = clip(0.5·min(ratio/1.5, 1) + 0.5·min(robust_z/8, 1), 0, 1)`，精确形式待定。
-3. **分钟级 growth 抖动**：`growth = S[t]/S[t-1]-1` 在分钟级偏抖；可对 growth 单独加 2–3 分钟小平滑（**不**平滑 ratio/robust-z，以免削峰）。
-4. **缓存刷新与一致性**：季节基线缓存的刷新周期、`(P,M)` 上下线时的缓存增删、跨天边界的偏移对齐。
-5. **候选排序精确口径**：§5.1 用「窗口内 RPM 贡献」还是「窗口内 (current − 近端 rolling) 」排序，二者在无基线时的稳健性不同，待定。
-6. **解释性输出（可选）**：参考设计的 `abs-z` / `episode 峰值回填` / `reason(overload_share_and_growth vs abs_and_growth)` 标签主要服务网页展示，不影响限流，按需补。
-7. **调度落点**：Mode B 是一个**新的定时入口**（遍历 `(P,M)` + 缓存），而非现有 [plugin/main.py](plugin/main.py) 的单告警 CLI；二者可共用检测/根因/限流函数，但入口与 I/O 不同。
-
----
-
-## 13. 与 v2 / 告警路径的对照
-
-| 环节 | Mode A（v2 告警） | Mode B（主动巡检） |
-| --- | --- | --- |
-| 入口 | 单告警 CLI | 定时巡检遍历 `(P,M)` |
-| Step 1 | 延迟事件（TTFT/TPOT ≥ SLA） | **流量事件（ratio/robust-z/growth）** |
-| 事件 scope | ttft_only / tpot_only / both | **无（trigger_type=volume）** |
-| Step 2 候选 | `max(ttft/sla, tpot/sla)` | **RPM excess** |
-| Step 2 culprit | 三维 scope 加权评分 | **excess 排序 + share-z/growth 门控** |
-| Step 3 / 4 | 池子目标 + 区域放大 | **完全复用（scope-free）** |
-| 历史查询成本 | 每告警 1 次 | **每命中 1 次（系统基线走缓存）** |
-| 限流性质 | 正式 | **抢先 + TTL + confidence，可升级确认** |
+| 环节 | Mode A（告警） | Mode B（巡检） | 公司侧消费 |
+| --- | --- | --- | --- |
+| 触发 | CMA 告警插件调用 | `allServiceCheckOverLoad` 每 5 min | Case 4 双保障互为兜底 |
+| 命中判定 | 事件覆盖告警时刻 | 事件触及窗口末端（活跃） | redis 抑制重复告警 |
+| 恢复 | — | detect-only `normal` | `allServiceCheckOverLoadResume` 删标记 + 恢复告警 |
+| 产出 | 池级 remediation | strategies（常驻服务 × region） | maas-monitor 调 maas-manager add-strategy（按站点路由），普罗平台 OPS 执行 |
+| 执行 | 人工参考 | 人工 OPS 执行（`compeletion_token_limit` 本版本仅展示） | `CreateUserResidentModelFlowControlByAdmin` |
 
 ---
 
-> 一句话总结：**主动巡检 = 把 v2 的检测信号从「延迟」换成「流量总量」、把入口从「等告警」换成「定时巡检 + 缓存基线」、把产出从「正式限流」换成「带 TTL 的抢先限流」，而 Step 2 之后的根因→区域放大→fan-out 全部原样复用。**
+## 13. 推迟项：流量总量前置筛查
+
+早期 Mode B 设计（见 git 历史 `9beb637` 版本的本文件，及 `48b8609` 的全指标 workflow 图）曾规划在 TTFT 之外增加 **RPM/TPM 对季节基线**（ratio / robust-z / growth）的前置流量筛查，在延迟击穿之前抢先发现突增并施加带 TTL 的 preemptive 限流。本轮**不实现**，原因：
+
+1. 公司 630 版本明确「本轮暂时只参考 TTFT」；
+2. 季节基线需要每天刷新的缓存载体——单发 CLI 进程不常驻，巡检时现拉 14 天系统历史约 10 页 = 10 次调用，直接烧光 appcode 一分钟配额；
+3. preemptive + TTL 的自动撤销语义与公司「策略待 OPS 人工执行」的人在回路流程不匹配。
+
+待算法 Java 服务化进入 maas-monitor（有真缓存与进程常驻）后再评估恢复，彼时本文件 §4.1 的检测器可平行加一条流量判据，Step 2 之后链路不变。
